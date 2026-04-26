@@ -24,6 +24,11 @@ pub const handshake = @import("handshake.zig");
 pub const HandshakeState = handshake.HandshakeState;
 pub const Role = handshake.Role;
 
+pub const framing = @import("framing.zig");
+
+pub const connection = @import("connection.zig");
+pub const Connection = connection.Connection;
+
 pub const testing = @import("testing/deterministic.zig");
 
 test {
@@ -35,5 +40,7 @@ test {
     _ = @import("pattern.zig");
     _ = @import("rng.zig");
     _ = @import("handshake.zig");
+    _ = @import("framing.zig");
+    _ = @import("connection.zig");
     _ = @import("testing/deterministic.zig");
 }

@@ -1,0 +1,298 @@
+//! Sans-IO connection: the surface a caller's driver loop interacts with.
+//!
+//! Lifecycle:
+//!
+//!   1. `initInitiator(gpa, opts)` or `initResponder(gpa, opts)` builds
+//!      a Connection in `.handshaking` state. The initiator's first
+//!      handshake message is queued immediately into the outbox.
+//!
+//!   2. The driver loop shuttles bytes:
+//!        * Read from the socket → `recv(bytes)`
+//!        * Write `outgoing()` to the socket → `consumeOutgoing(n)`
+//!
+//!   3. `recv` advances the handshake automatically: when a complete
+//!      handshake message has arrived it is processed, and if it's
+//!      now our turn to respond the next message is queued.
+//!
+//!   4. After the final handshake message both sides transition to
+//!      `.established`. From then on, `send(plaintext)` encrypts and
+//!      queues a transport frame, and `nextMessage()` pops the next
+//!      decrypted plaintext that arrived.
+//!
+//! No part of this file imports `std.net`. The TCP loop lives in the
+//! caller's driver, demonstrated in test client/server programs.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const cipher_state = @import("cipher_state.zig");
+const symmetric_state = @import("symmetric_state.zig");
+const handshake = @import("handshake.zig");
+const framing = @import("framing.zig");
+
+const CipherState = cipher_state.CipherState;
+const HandshakeState = handshake.HandshakeState;
+const Role = handshake.Role;
+
+pub const Error = error{
+    /// `send` was called before the handshake completed.
+    NotEstablished,
+    /// Operation called on a connection that has been closed or errored.
+    ConnectionClosed,
+} || handshake.Error || framing.Error;
+
+pub const Established = struct {
+    /// Cipher used to decrypt inbound transport messages.
+    rx: CipherState,
+    /// Cipher used to encrypt outbound transport messages.
+    tx: CipherState,
+};
+
+pub const State = union(enum) {
+    handshaking: HandshakeState,
+    established: Established,
+    closed: void,
+};
+
+pub const Connection = struct {
+    gpa: Allocator,
+    state: State,
+    rx: framing.FrameReader,
+    tx: framing.FrameWriter,
+    /// Decrypted transport messages, oldest first. Owned by `gpa`; caller
+    /// frees via `freeMessage` after `nextMessage` pops one.
+    inbox: std.ArrayList([]u8),
+
+    pub fn initInitiator(gpa: Allocator, opts: handshake.Init) Error!Connection {
+        std.debug.assert(opts.role == .initiator);
+        var conn: Connection = .{
+            .gpa = gpa,
+            .state = .{ .handshaking = HandshakeState.init(opts) },
+            .rx = .empty,
+            .tx = .empty,
+            .inbox = .empty,
+        };
+        try conn.driveOutboundHandshake();
+        return conn;
+    }
+
+    pub fn initResponder(gpa: Allocator, opts: handshake.Init) Connection {
+        std.debug.assert(opts.role == .responder);
+        return .{
+            .gpa = gpa,
+            .state = .{ .handshaking = HandshakeState.init(opts) },
+            .rx = .empty,
+            .tx = .empty,
+            .inbox = .empty,
+        };
+    }
+
+    pub fn deinit(self: *Connection) void {
+        self.rx.deinit(self.gpa);
+        self.tx.deinit(self.gpa);
+        for (self.inbox.items) |msg| self.gpa.free(msg);
+        self.inbox.deinit(self.gpa);
+        switch (self.state) {
+            .handshaking => |*hs| hs.secureZero(),
+            .established => |*est| {
+                est.rx.secureZero();
+                est.tx.secureZero();
+            },
+            .closed => {},
+        }
+        self.state = .closed;
+    }
+
+    pub fn isEstablished(self: Connection) bool {
+        return self.state == .established;
+    }
+
+    /// Caller pushes bytes that arrived from the network. Drives both the
+    /// handshake (until `.established`) and the transport (decrypting any
+    /// fully-arrived frames into `inbox`).
+    pub fn recv(self: *Connection, bytes: []const u8) Error!void {
+        if (self.state == .closed) return error.ConnectionClosed;
+        try self.rx.push(self.gpa, bytes);
+        try self.processInbound();
+    }
+
+    /// Encrypt `plaintext` and queue it as a transport frame.
+    pub fn send(self: *Connection, plaintext: []const u8) Error!void {
+        switch (self.state) {
+            .established => |*est| {
+                if (plaintext.len + cipher_state.tag_length > framing.max_frame_payload)
+                    return error.FrameTooLarge;
+                const frame = try self.gpa.alloc(u8, plaintext.len + cipher_state.tag_length);
+                defer self.gpa.free(frame);
+                try est.tx.encryptWithAd(&.{}, plaintext, frame);
+                try self.tx.push(self.gpa, frame);
+            },
+            .handshaking => return error.NotEstablished,
+            .closed => return error.ConnectionClosed,
+        }
+    }
+
+    /// Pop the next decrypted transport message. Caller takes ownership;
+    /// release with `freeMessage`.
+    pub fn nextMessage(self: *Connection) ?[]u8 {
+        if (self.inbox.items.len == 0) return null;
+        return self.inbox.orderedRemove(0);
+    }
+
+    pub fn freeMessage(self: *Connection, msg: []u8) void {
+        self.gpa.free(msg);
+    }
+
+    /// Bytes the caller should write to the socket. Borrowed; invalidated
+    /// by any other call. Ack with `consumeOutgoing(n)` once written.
+    pub fn outgoing(self: Connection) []const u8 {
+        return self.tx.outgoing();
+    }
+
+    pub fn consumeOutgoing(self: *Connection, n: usize) void {
+        self.tx.consume(n);
+    }
+
+    pub fn handshakeHash(self: Connection) ?[symmetric_state.hash_length]u8 {
+        return switch (self.state) {
+            .handshaking => |hs| hs.handshakeHash(),
+            else => null,
+        };
+    }
+
+    // ── Internal: handshake + transport drivers ───────────────────────
+
+    fn processInbound(self: *Connection) Error!void {
+        while (self.rx.peek()) |frame| {
+            switch (self.state) {
+                .handshaking => |*hs| {
+                    const payload_len = try hs.readPayloadLen(frame.len);
+                    const payload = try self.gpa.alloc(u8, payload_len);
+                    defer self.gpa.free(payload);
+                    const result = try hs.readMessage(frame, payload);
+                    self.rx.pop();
+                    if (result.split) |sp| {
+                        try self.transitionToEstablished(sp);
+                        // Loop continues — any further frames are transport.
+                    } else {
+                        // It's now our turn (or peer's — drive will decide).
+                        try self.driveOutboundHandshake();
+                    }
+                },
+                .established => |*est| {
+                    if (frame.len < cipher_state.tag_length) return error.InvalidMessageLength;
+                    const plaintext_len = frame.len - cipher_state.tag_length;
+                    const plaintext = try self.gpa.alloc(u8, plaintext_len);
+                    errdefer self.gpa.free(plaintext);
+                    try est.rx.decryptWithAd(&.{}, frame, plaintext);
+                    try self.inbox.append(self.gpa, plaintext);
+                    self.rx.pop();
+                },
+                .closed => return error.ConnectionClosed,
+            }
+        }
+    }
+
+    /// While it's our turn, generate handshake message(s) into the tx
+    /// queue. Walks the pattern until either the handshake completes or
+    /// it's the peer's turn to send.
+    fn driveOutboundHandshake(self: *Connection) Error!void {
+        while (true) {
+            switch (self.state) {
+                .handshaking => |*hs| {
+                    if (!hs.isMyTurn()) return;
+                    const msg_len = try hs.writeMessageLen(0);
+                    const buf = try self.gpa.alloc(u8, msg_len);
+                    defer self.gpa.free(buf);
+                    const result = try hs.writeMessage("", buf);
+                    try self.tx.push(self.gpa, buf);
+                    if (result.split) |sp| {
+                        try self.transitionToEstablished(sp);
+                        return;
+                    }
+                },
+                else => return,
+            }
+        }
+    }
+
+    fn transitionToEstablished(self: *Connection, sp: symmetric_state.Split) !void {
+        const role = switch (self.state) {
+            .handshaking => |hs| hs.role,
+            else => unreachable,
+        };
+        // Per Noise §5.2: c1 = initiator→responder, c2 = responder→initiator.
+        const established: Established = switch (role) {
+            .initiator => .{ .tx = sp.c1, .rx = sp.c2 },
+            .responder => .{ .tx = sp.c2, .rx = sp.c1 },
+        };
+        switch (self.state) {
+            .handshaking => |*hs| hs.secureZero(),
+            else => {},
+        }
+        self.state = .{ .established = established };
+    }
+};
+
+// ── Inline tests ──────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const kem = @import("kem.zig");
+const pattern = @import("pattern.zig");
+const Rng = @import("rng.zig").Rng;
+const SeedStream = @import("testing/deterministic.zig").SeedStream;
+const test_helpers = @import("testing/deterministic.zig");
+
+fn rngFromSeedStream(s: *SeedStream) Rng {
+    return .{
+        .ctx = s,
+        .fillFn = struct {
+            fn fill(ctx: *anyopaque, out: []u8) void {
+                const stream: *SeedStream = @ptrCast(@alignCast(ctx));
+                stream.bytes(out);
+            }
+        }.fill,
+    };
+}
+
+test "initInitiator queues handshake message 1 in the outgoing buffer" {
+    const gpa = testing.allocator;
+    var setup = SeedStream.init("conn-init1");
+    const i_kp = try test_helpers.keypair(&setup);
+    const r_kp = try test_helpers.keypair(&setup);
+    var i_rng = SeedStream.init("conn-init1-i");
+
+    var conn = try Connection.initInitiator(gpa, .{
+        .pattern = &pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer conn.deinit();
+
+    // msg1 = 2-byte hdr + e_pub (1184) + empty payload (no tag yet).
+    try testing.expectEqual(
+        @as(usize, framing.frame_header_len + kem.public_key_length),
+        conn.outgoing().len,
+    );
+}
+
+test "send before established returns NotEstablished" {
+    const gpa = testing.allocator;
+    var setup = SeedStream.init("conn-not-est");
+    const i_kp = try test_helpers.keypair(&setup);
+    const r_kp = try test_helpers.keypair(&setup);
+    var i_rng = SeedStream.init("conn-not-est-i");
+
+    var conn = try Connection.initInitiator(gpa, .{
+        .pattern = &pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer conn.deinit();
+
+    try testing.expectError(error.NotEstablished, conn.send("nope"));
+}

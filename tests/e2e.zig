@@ -192,6 +192,207 @@ test "pqKK is byte-for-byte deterministic under the same seeds" {
     try testing.expectEqualSlices(u8, a, b);
 }
 
+// ── Connection-level e2e (sans-IO byte shuttle) ──────────────────────────
+//
+// These tests stand in for "what the real TCP driver loop looks like" by
+// shuttling bytes between two `Connection`s in-process. The shuttle is
+// the moral equivalent of a socket pair — it never blocks and never
+// touches the network. Real TCP drivers will live in test client/server
+// programs once the sans-IO core is locked in.
+
+/// Move all queued outbound bytes from `from` into `to.recv()`. Returns
+/// the number of bytes shuttled.
+fn shuttle(from: *pqnoize.Connection, to: *pqnoize.Connection) !usize {
+    const out = from.outgoing();
+    if (out.len == 0) return 0;
+    const buf = try testing.allocator.alloc(u8, out.len);
+    defer testing.allocator.free(buf);
+    @memcpy(buf, out);
+    from.consumeOutgoing(out.len);
+    try to.recv(buf);
+    return buf.len;
+}
+
+fn driveHandshake(initiator: *pqnoize.Connection, responder: *pqnoize.Connection) !void {
+    // Initiator's msg1 was queued at init time. Shuttle it in.
+    _ = try shuttle(initiator, responder);
+    // Responder's msg2 was queued during the recv above. Shuttle it back.
+    _ = try shuttle(responder, initiator);
+    // Initiator's msg3 was queued during that recv. Shuttle it forward.
+    _ = try shuttle(initiator, responder);
+    try testing.expect(initiator.isEstablished());
+    try testing.expect(responder.isEstablished());
+}
+
+test "Connection: full handshake completes via byte shuttle" {
+    const gpa = testing.allocator;
+    var setup = pqnoize.testing.SeedStream.init("conn-e2e-static");
+    const i_kp = try pqnoize.testing.keypair(&setup);
+    const r_kp = try pqnoize.testing.keypair(&setup);
+    var i_rng = pqnoize.testing.SeedStream.init("conn-e2e-i");
+    var r_rng = pqnoize.testing.SeedStream.init("conn-e2e-r");
+
+    var initiator = try pqnoize.Connection.initInitiator(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer initiator.deinit();
+
+    var responder = pqnoize.Connection.initResponder(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .responder,
+        .rng = rngFromSeedStream(&r_rng),
+        .s = r_kp,
+        .rs = i_kp.public_key,
+    });
+    defer responder.deinit();
+
+    try driveHandshake(&initiator, &responder);
+}
+
+test "Connection: transport messages round-trip in both directions" {
+    const gpa = testing.allocator;
+    var setup = pqnoize.testing.SeedStream.init("conn-xport-static");
+    const i_kp = try pqnoize.testing.keypair(&setup);
+    const r_kp = try pqnoize.testing.keypair(&setup);
+    var i_rng = pqnoize.testing.SeedStream.init("conn-xport-i");
+    var r_rng = pqnoize.testing.SeedStream.init("conn-xport-r");
+
+    var initiator = try pqnoize.Connection.initInitiator(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer initiator.deinit();
+
+    var responder = pqnoize.Connection.initResponder(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .responder,
+        .rng = rngFromSeedStream(&r_rng),
+        .s = r_kp,
+        .rs = i_kp.public_key,
+    });
+    defer responder.deinit();
+
+    try driveHandshake(&initiator, &responder);
+
+    // Three messages each direction, interleaved.
+    try initiator.send("hello from initiator");
+    try initiator.send("second from initiator");
+    _ = try shuttle(&initiator, &responder);
+
+    {
+        const m1 = responder.nextMessage().?;
+        defer responder.freeMessage(m1);
+        try testing.expectEqualSlices(u8, "hello from initiator", m1);
+    }
+    {
+        const m2 = responder.nextMessage().?;
+        defer responder.freeMessage(m2);
+        try testing.expectEqualSlices(u8, "second from initiator", m2);
+    }
+    try testing.expect(responder.nextMessage() == null);
+
+    try responder.send("ack from responder");
+    _ = try shuttle(&responder, &initiator);
+    {
+        const reply = initiator.nextMessage().?;
+        defer initiator.freeMessage(reply);
+        try testing.expectEqualSlices(u8, "ack from responder", reply);
+    }
+}
+
+test "Connection: tampered transport ciphertext returns AuthenticationFailed" {
+    const gpa = testing.allocator;
+    var setup = pqnoize.testing.SeedStream.init("conn-tamper-static");
+    const i_kp = try pqnoize.testing.keypair(&setup);
+    const r_kp = try pqnoize.testing.keypair(&setup);
+    var i_rng = pqnoize.testing.SeedStream.init("conn-tamper-i");
+    var r_rng = pqnoize.testing.SeedStream.init("conn-tamper-r");
+
+    var initiator = try pqnoize.Connection.initInitiator(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer initiator.deinit();
+
+    var responder = pqnoize.Connection.initResponder(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .responder,
+        .rng = rngFromSeedStream(&r_rng),
+        .s = r_kp,
+        .rs = i_kp.public_key,
+    });
+    defer responder.deinit();
+
+    try driveHandshake(&initiator, &responder);
+
+    try initiator.send("payload to be tampered");
+    // Grab the outgoing bytes, flip one inside the ciphertext (skip the
+    // 2-byte length prefix), feed the corrupted version to the responder.
+    const out = initiator.outgoing();
+    const buf = try gpa.alloc(u8, out.len);
+    defer gpa.free(buf);
+    @memcpy(buf, out);
+    initiator.consumeOutgoing(out.len);
+    buf[buf.len - 1] ^= 1;
+    try testing.expectError(error.AuthenticationFailed, responder.recv(buf));
+}
+
+test "Connection: byte-at-a-time recv still drives the handshake to completion" {
+    const gpa = testing.allocator;
+    var setup = pqnoize.testing.SeedStream.init("conn-frag-static");
+    const i_kp = try pqnoize.testing.keypair(&setup);
+    const r_kp = try pqnoize.testing.keypair(&setup);
+    var i_rng = pqnoize.testing.SeedStream.init("conn-frag-i");
+    var r_rng = pqnoize.testing.SeedStream.init("conn-frag-r");
+
+    var initiator = try pqnoize.Connection.initInitiator(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer initiator.deinit();
+
+    var responder = pqnoize.Connection.initResponder(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .responder,
+        .rng = rngFromSeedStream(&r_rng),
+        .s = r_kp,
+        .rs = i_kp.public_key,
+    });
+    defer responder.deinit();
+
+    // Feed initiator's outgoing one byte at a time into responder.
+    const feedOneByOne = struct {
+        fn run(from: *pqnoize.Connection, to: *pqnoize.Connection, alloc: std.mem.Allocator) !void {
+            const out = from.outgoing();
+            if (out.len == 0) return;
+            const buf = try alloc.alloc(u8, out.len);
+            defer alloc.free(buf);
+            @memcpy(buf, out);
+            from.consumeOutgoing(out.len);
+            for (buf) |byte| try to.recv(&[_]u8{byte});
+        }
+    }.run;
+
+    try feedOneByOne(&initiator, &responder, gpa);
+    try feedOneByOne(&responder, &initiator, gpa);
+    try feedOneByOne(&initiator, &responder, gpa);
+    try testing.expect(initiator.isEstablished());
+    try testing.expect(responder.isEstablished());
+}
+
 test "tampered handshake message: AEAD on payload fails on responder" {
     const allocator = testing.allocator;
     var i_rng: pqnoize.testing.SeedStream = undefined;
