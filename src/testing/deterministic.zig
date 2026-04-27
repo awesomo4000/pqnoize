@@ -53,6 +53,35 @@ pub fn encaps(pk: kem.Kem.PublicKey, stream: *SeedStream) kem.Kem.EncapsulatedSe
     return pk.encapsDeterministic(&seed);
 }
 
+/// Test-only: an `Rng` that returns pre-canned bytes from a fixed buffer
+/// in order. Used by oracle tests where every byte of randomness must be
+/// pinned to match an externally-frozen reference trace.
+///
+/// Panics if the handshake demands more bytes than were provided —
+/// that's a test setup bug, not a runtime error worth dressing up.
+pub const FixedBytesRng = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+
+    pub fn init(bytes: []const u8) FixedBytesRng {
+        return .{ .bytes = bytes };
+    }
+
+    pub fn rng(self: *FixedBytesRng) @import("../rng.zig").Rng {
+        return .{
+            .ctx = self,
+            .fillFn = fill,
+        };
+    }
+
+    fn fill(ctx: *anyopaque, out: []u8) void {
+        const self: *FixedBytesRng = @ptrCast(@alignCast(ctx));
+        std.debug.assert(self.cursor + out.len <= self.bytes.len);
+        @memcpy(out, self.bytes[self.cursor..][0..out.len]);
+        self.cursor += out.len;
+    }
+};
+
 // ── Inline tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;

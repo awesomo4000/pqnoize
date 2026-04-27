@@ -49,6 +49,12 @@ pub const Init = struct {
     rs: kem.Kem.PublicKey,
     prologue: []const u8 = &.{},
     protocol_name: []const u8 = pattern.pqKK_MLKEM768_protocol_name,
+    /// Test-only: pre-built ephemeral keypair. When provided, the `.e`
+    /// token uses this instead of generating from the RNG. Lets tests
+    /// freeze the ephemeral keypair against an external reference (e.g.
+    /// the clatter oracle) without depending on RNG-byte-stream order
+    /// matching across implementations.
+    e: ?kem.Kem.KeyPair = null,
 };
 
 pub const WriteResult = struct {
@@ -96,6 +102,7 @@ pub const HandshakeState = struct {
             .msg_index = 0,
             .s = opts.s,
             .rs = opts.rs,
+            .e = opts.e,
         };
     }
 
@@ -169,9 +176,11 @@ pub const HandshakeState = struct {
 
         for (tokens) |t| switch (t) {
             .e => {
-                self.rng.bytes(rng_buf[0..kem.seed_length]);
-                self.e = kem.Kem.KeyPair.generateDeterministic(rng_buf) catch
-                    return error.InvalidPublicKey;
+                if (self.e == null) {
+                    self.rng.bytes(rng_buf[0..kem.seed_length]);
+                    self.e = kem.Kem.KeyPair.generateDeterministic(rng_buf) catch
+                        return error.InvalidPublicKey;
+                }
                 const e_pub: [kem.public_key_length]u8 = self.e.?.public_key.toBytes();
                 @memcpy(out[pos..][0..kem.public_key_length], &e_pub);
                 self.sym.mixHash(&e_pub);
