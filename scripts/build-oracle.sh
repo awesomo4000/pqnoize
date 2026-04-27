@@ -35,31 +35,40 @@ required_rust_version=$(grep -oE 'channel = "[^"]+"' "$oracle_dir/rust-toolchain
 
 ensure_rustup() {
     if command -v rustup >/dev/null 2>&1 && [[ -d "$RUSTUP_HOME" ]]; then
+        echo "==> rustup already present at $RUSTUP_HOME (skip install)"
         return
     fi
     echo "==> Installing project-local rustup into $toolchain_dir"
+    echo "    (one-time download, ~5 MB)"
     mkdir -p "$toolchain_dir"
     # Install rustup non-interactively, no shell modifications, default profile.
+    # rustup-init prints its own progress.
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --default-toolchain none
 }
 
 ensure_toolchain() {
     if rustup toolchain list 2>/dev/null | grep -q "^$required_rust_version"; then
+        echo "==> Rust $required_rust_version already installed (skip)"
         return
     fi
     echo "==> Installing Rust toolchain $required_rust_version"
+    echo "    (one-time download, ~150 MB; rustup shows progress)"
     rustup toolchain install "$required_rust_version" --profile minimal
 }
 
 build_harness() {
-    echo "==> Building oracle harness"
-    (cd "$oracle_dir" && cargo build --release --quiet)
+    echo "==> Building oracle harness (cargo shows compile progress)"
+    echo "    First run pulls clatter + ml-kem + transitive deps,"
+    echo "    cached in $CARGO_HOME thereafter."
+    (cd "$oracle_dir" && cargo build --release)
 }
 
 run_harness() {
-    echo "==> Generating $out_path"
-    (cd "$oracle_dir" && cargo run --release --quiet) > "$out_path"
+    echo "==> Running harness, writing $out_path"
+    # cargo status messages go to stderr (pass through); harness output on
+    # stdout is redirected into the Zig vector file.
+    (cd "$oracle_dir" && cargo run --release) > "$out_path"
 }
 
 main() {
