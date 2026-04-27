@@ -45,18 +45,23 @@ pub const Pattern = struct {
 ///   pre_initiator: [s]
 ///   pre_responder: [s]
 ///   messages:
-///     -> [e]
+///     -> [skem, e]
 ///     <- [ekem, skem]
-///     -> [skem]
 ///
-/// Three messages, mutual KEM authentication, no DH anywhere.
+/// Two messages, mirroring classical Noise KK. Because each side knows
+/// the other's static pubkey via the pre-messages, the initiator can
+/// `skem` to the responder's static immediately in message 1, alongside
+/// its own ephemeral. The responder replies by encapsulating to the just-
+/// received ephemeral (`ekem`) and to the pre-known initiator static
+/// (`skem`). Mutual KEM authentication completes after 2 RTTs.
+///
+/// Source: PQNoise paper (eprint 2022/539), Figure 2.
 pub const pqKK: Pattern = .{
     .pre_initiator = &.{.s},
     .pre_responder = &.{.s},
     .messages = &.{
-        &.{.e},
+        &.{ .skem, .e },
         &.{ .ekem, .skem },
-        &.{.skem},
     },
 };
 
@@ -70,14 +75,13 @@ pub const pqKK_MLKEM768_protocol_name: []const u8 =
 
 const testing = std.testing;
 
-test "pqKK token sequence matches PQNoise paper" {
+test "pqKK token sequence matches PQNoise paper Figure 2" {
     try testing.expectEqual(@as(usize, 1), pqKK.pre_initiator.len);
     try testing.expectEqual(Token.s, pqKK.pre_initiator[0]);
     try testing.expectEqual(@as(usize, 1), pqKK.pre_responder.len);
     try testing.expectEqual(Token.s, pqKK.pre_responder[0]);
-    try testing.expectEqual(@as(usize, 3), pqKK.messages.len);
+    try testing.expectEqual(@as(usize, 2), pqKK.messages.len);
 
-    try testing.expectEqualSlices(Token, &.{.e}, pqKK.messages[0]);
+    try testing.expectEqualSlices(Token, &.{ .skem, .e }, pqKK.messages[0]);
     try testing.expectEqualSlices(Token, &.{ .ekem, .skem }, pqKK.messages[1]);
-    try testing.expectEqualSlices(Token, &.{.skem}, pqKK.messages[2]);
 }

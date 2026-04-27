@@ -165,9 +165,8 @@ pub const pqKK: Pattern = .{
     .pre_initiator = &.{.s},
     .pre_responder = &.{.s},
     .messages = &.{
-        &.{.e},
+        &.{ .skem, .e },
         &.{ .ekem, .skem },
-        &.{.skem},
     },
 };
 

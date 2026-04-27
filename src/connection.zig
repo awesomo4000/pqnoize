@@ -271,9 +271,13 @@ test "initInitiator queues handshake message 1 in the outgoing buffer" {
     });
     defer conn.deinit();
 
-    // msg1 = 2-byte hdr + e_pub (1184) + empty payload (no tag yet).
+    // msg1 = [skem, e] + empty AEAD-tagged payload.
+    // Frame: 2-byte hdr + ciphertext (1088) + e_pub (1184) + tag (16).
     try testing.expectEqual(
-        @as(usize, framing.frame_header_len + kem.public_key_length),
+        @as(usize, framing.frame_header_len +
+            kem.ciphertext_length +
+            kem.public_key_length +
+            cipher_state.tag_length),
         conn.outgoing().len,
     );
 }

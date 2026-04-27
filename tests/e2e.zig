@@ -73,8 +73,10 @@ test "pqKK full handshake: payloads round-trip and Split keys agree" {
     var r_rng: pqnoize.testing.SeedStream = undefined;
     var pair = try setupPair("e2e-static", "e2e-i", "e2e-r", &i_rng, &r_rng);
 
-    // ── msg 1: initiator -> responder ─────────────────────────────────
-    const p1 = "first payload (cleartext)";
+    // ── msg 1: initiator -> responder (skem, e + payload) ───────────
+    // Cipher is armed by the leading skem, so the payload is encrypted
+    // already in this first message.
+    const p1 = "first payload (encrypted under skem-derived key)";
     const m1_len = try pair.initiator.writeMessageLen(p1.len);
     const m1 = try allocator.alloc(u8, m1_len);
     defer allocator.free(m1);
@@ -88,35 +90,20 @@ test "pqKK full handshake: payloads round-trip and Split keys agree" {
     try testing.expect(r1.split == null);
     try testing.expectEqualSlices(u8, p1, p1_out);
 
-    // ── msg 2: responder -> initiator ─────────────────────────────────
-    const p2 = "second payload (now encrypted under k1)";
+    // ── msg 2: responder -> initiator (final; both sides emit Split) ──
+    const p2 = "final payload";
     const m2_len = try pair.responder.writeMessageLen(p2.len);
     const m2 = try allocator.alloc(u8, m2_len);
     defer allocator.free(m2);
     const w2 = try pair.responder.writeMessage(p2, m2);
-    try testing.expect(w2.split == null);
+    try testing.expect(w2.split != null);
 
     const p2_out_len = try pair.initiator.readPayloadLen(m2.len);
     const p2_out = try allocator.alloc(u8, p2_out_len);
     defer allocator.free(p2_out);
     const r2 = try pair.initiator.readMessage(m2, p2_out);
-    try testing.expect(r2.split == null);
+    try testing.expect(r2.split != null);
     try testing.expectEqualSlices(u8, p2, p2_out);
-
-    // ── msg 3: initiator -> responder (final; both sides emit Split) ──
-    const p3 = "final payload";
-    const m3_len = try pair.initiator.writeMessageLen(p3.len);
-    const m3 = try allocator.alloc(u8, m3_len);
-    defer allocator.free(m3);
-    const w3 = try pair.initiator.writeMessage(p3, m3);
-    try testing.expect(w3.split != null);
-
-    const p3_out_len = try pair.responder.readPayloadLen(m3.len);
-    const p3_out = try allocator.alloc(u8, p3_out_len);
-    defer allocator.free(p3_out);
-    const r3 = try pair.responder.readMessage(m3, p3_out);
-    try testing.expect(r3.split != null);
-    try testing.expectEqualSlices(u8, p3, p3_out);
 
     // Both sides land on identical handshake hashes.
     try testing.expectEqualSlices(
@@ -126,8 +113,8 @@ test "pqKK full handshake: payloads round-trip and Split keys agree" {
     );
 
     // Both sides agree on the two transport keys.
-    const i_split = w3.split.?;
-    const r_split = r3.split.?;
+    const i_split = r2.split.?;
+    const r_split = w2.split.?;
     try testing.expectEqualSlices(u8, &i_split.c1.k, &r_split.c1.k);
     try testing.expectEqualSlices(u8, &i_split.c2.k, &r_split.c2.k);
 
@@ -142,8 +129,8 @@ test "pqKK transport: post-handshake messages encrypt and decrypt" {
     var r_rng: pqnoize.testing.SeedStream = undefined;
     var pair = try setupPair("xport-static", "xport-i", "xport-r", &i_rng, &r_rng);
 
-    // Burn through the three handshake messages with empty payloads.
-    inline for (0..3) |_| {
+    // Burn through the two handshake messages with empty payloads.
+    inline for (0..2) |_| {
         const writer: *pqnoize.HandshakeState =
             if (pair.initiator.isMyTurn()) &pair.initiator else &pair.responder;
         const reader: *pqnoize.HandshakeState =
@@ -214,12 +201,11 @@ fn shuttle(from: *pqnoize.Connection, to: *pqnoize.Connection) !usize {
 }
 
 fn driveHandshake(initiator: *pqnoize.Connection, responder: *pqnoize.Connection) !void {
-    // Initiator's msg1 was queued at init time. Shuttle it in.
+    // Initiator's msg1 (skem, e) was queued at init time. Shuttle it in.
     _ = try shuttle(initiator, responder);
-    // Responder's msg2 was queued during the recv above. Shuttle it back.
+    // Responder's msg2 (ekem, skem) was queued during the recv above and
+    // its writeMessage emits the Split on completion. Shuttle it back.
     _ = try shuttle(responder, initiator);
-    // Initiator's msg3 was queued during that recv. Shuttle it forward.
-    _ = try shuttle(initiator, responder);
     try testing.expect(initiator.isEstablished());
     try testing.expect(responder.isEstablished());
 }
@@ -388,7 +374,6 @@ test "Connection: byte-at-a-time recv still drives the handshake to completion" 
 
     try feedOneByOne(&initiator, &responder, gpa);
     try feedOneByOne(&responder, &initiator, gpa);
-    try feedOneByOne(&initiator, &responder, gpa);
     try testing.expect(initiator.isEstablished());
     try testing.expect(responder.isEstablished());
 }

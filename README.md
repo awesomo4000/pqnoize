@@ -39,12 +39,14 @@ Both peers' static KEM keys are pre-known.
 pre_initiator: [s]
 pre_responder: [s]
 messages:
-  -> [e]
+  -> [skem, e]
   <- [ekem, skem]
-  -> [skem]
 ```
 
-Three messages, mutual KEM authentication via `skem`, no DH anywhere.
+Two messages, mutual KEM authentication via `skem`, no DH anywhere.
+Mirrors classical Noise KK (also two messages) — because both sides
+already know each other's static, the initiator can encapsulate to the
+responder's static in its very first message.
 See [API.md](API.md) for the full call surface.
 
 ## Build & test

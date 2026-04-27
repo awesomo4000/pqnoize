@@ -312,23 +312,24 @@ test "writeMessageLen / readPayloadLen are consistent across all pqKK messages" 
         .rs = i_kp.public_key,
     });
 
-    // msg 1: only [e], no MixKey yet, no tag.
+    // msg 1: [skem, e]. The leading skem arms the cipher, so the trailing
+    // payload picks up a 16-byte AEAD tag.
+    const msg1_overhead = kem.ciphertext_length + kem.public_key_length + cipher_state.tag_length;
     try testing.expectEqual(
-        @as(usize, kem.public_key_length + 5),
+        @as(usize, msg1_overhead + 5),
         try initr.writeMessageLen(5),
     );
-    // msg 2: [ekem, skem], MixKey runs, tag added.
-    // Can't inspect msg-2 sizing until msg-1 is processed (msg_index advances).
 
-    var msg1: [kem.public_key_length + 5]u8 = undefined;
-    _ = try initr.writeMessage("hello", &msg1);
-    try testing.expectEqual(@as(usize, 5), try resp.readPayloadLen(msg1.len));
+    const m1_buf = try testing.allocator.alloc(u8, msg1_overhead + 5);
+    defer testing.allocator.free(m1_buf);
+    _ = try initr.writeMessage("hello", m1_buf);
+    try testing.expectEqual(@as(usize, 5), try resp.readPayloadLen(m1_buf.len));
 
     var p1: [5]u8 = undefined;
-    _ = try resp.readMessage(&msg1, &p1);
+    _ = try resp.readMessage(m1_buf, &p1);
     try testing.expectEqualSlices(u8, "hello", &p1);
 
-    // msg 2 sizing: 2*ct + payload + tag
+    // msg 2: [ekem, skem] + payload + tag.
     try testing.expectEqual(
         @as(usize, 2 * kem.ciphertext_length + 7 + cipher_state.tag_length),
         try resp.writeMessageLen(7),
