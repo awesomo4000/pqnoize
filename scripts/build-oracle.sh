@@ -33,6 +33,24 @@ export PATH="$CARGO_HOME/bin:$PATH"
 
 required_rust_version=$(grep -oE 'channel = "[^"]+"' "$oracle_dir/rust-toolchain.toml" | sed 's/channel = "\(.*\)"/\1/')
 
+ensure_c_toolchain() {
+    if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then
+        return
+    fi
+    cat >&2 <<EOF
+==> ERROR: no C compiler ('cc', 'gcc', or 'clang') found on PATH.
+
+Rust's linker and a couple of build-script crates (e.g. generic-array,
+typenum) need a C toolchain. Install one and re-run:
+
+    Debian/Ubuntu: sudo apt install build-essential
+    Fedora/RHEL:   sudo dnf install gcc
+    Arch:          sudo pacman -S base-devel
+    macOS:         xcode-select --install
+EOF
+    exit 1
+}
+
 ensure_rustup() {
     if command -v rustup >/dev/null 2>&1 && [[ -d "$RUSTUP_HOME" ]]; then
         echo "==> rustup already present at $RUSTUP_HOME (skip install)"
@@ -72,6 +90,7 @@ run_harness() {
 }
 
 main() {
+    ensure_c_toolchain
     ensure_rustup
     ensure_toolchain
     build_harness

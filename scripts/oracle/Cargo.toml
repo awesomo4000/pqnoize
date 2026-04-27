@@ -2,6 +2,7 @@
 name = "pqnoize-oracle"
 version = "0.0.0"
 edition = "2021"
+rust-version = "1.85.0"
 publish = false
 
 [dependencies]
@@ -15,8 +16,8 @@ clatter = { version = "=2.2.0", default-features = false, features = [
 
 # We use these directly to drive pqKK manually (bypassing clatter's
 # RNG-driven `PqHandshake` so the vectors are byte-deterministic).
-ml-kem = { version = "0.2", default-features = false, features = ["alloc", "deterministic"] }
-sha2 = { version = "0.10", default-features = false }
+ml-kem = { version = "=0.2.1", default-features = false, features = ["std", "deterministic"] }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
 rand_core = "0.6"
 
 [profile.release]
