@@ -71,4 +71,47 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_kats.step);
     test_step.dependOn(&run_e2e.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Fuzz steps — deliberately NOT wired into `zig build test`.
+    //
+    // Each target is its own test artifact so individual fuzzers can be
+    // run in isolation. By default each step does ONE smoke pass through
+    // the fuzz targets (CI-suitable). To enter continuous coverage-
+    // guided fuzz mode, append `--fuzz` to the `zig build` invocation:
+    //
+    //   zig build fuzz-framing            — one smoke pass
+    //   zig build fuzz-framing --fuzz     — continuous, Ctrl-C to stop
+    //   zig build fuzz-connection --fuzz  — same, for Connection.recv
+    //   zig build fuzz --fuzz             — continuous, all targets
+    //
+    // The `--fuzz` flag is consumed by `zig build` itself; the
+    // build runner reinstruments the test binary with coverage probes
+    // and drives it iteratively.
+    const fuzz_framing_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz_framing.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "pqnoize", .module = mod }},
+        }),
+    });
+    const run_fuzz_framing = b.addRunArtifact(fuzz_framing_tests);
+    const fuzz_framing_step = b.step("fuzz-framing", "Fuzz framing parser (add --fuzz for continuous mode)");
+    fuzz_framing_step.dependOn(&run_fuzz_framing.step);
+
+    const fuzz_connection_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz_connection.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "pqnoize", .module = mod }},
+        }),
+    });
+    const run_fuzz_connection = b.addRunArtifact(fuzz_connection_tests);
+    const fuzz_connection_step = b.step("fuzz-connection", "Fuzz Connection.recv (add --fuzz for continuous mode)");
+    fuzz_connection_step.dependOn(&run_fuzz_connection.step);
+
+    const fuzz_step = b.step("fuzz", "Run all fuzz targets (add --fuzz for continuous mode)");
+    fuzz_step.dependOn(&run_fuzz_framing.step);
+    fuzz_step.dependOn(&run_fuzz_connection.step);
 }
