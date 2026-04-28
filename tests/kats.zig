@@ -113,11 +113,8 @@ test "Noise nonce construction: CipherState output decrypts under hand-built non
 // FIPS-203 fixes the ML-KEM-768 byte sizes. If we accidentally pick up the
 // 512 or 1024 variant (or stdlib renames its types), this fires immediately
 // at test time rather than producing a working-but-wrong network protocol.
-//
-// TODO: swap in NIST ACVP byte vectors (seed -> pk/sk/ct/ss) for a full KAT
-// once the project takes a network/file dependency. Today we stand on
-// stdlib's own NIST KATs for the Kyber d00 line; FIPS-203 nist.* vectors
-// aren't checked in stdlib so we'd have to bring our own.
+// (The deeper FIPS-203 conformance check is the NIST ACVP test suite at
+// the bottom of this file.)
 test "ML-KEM-768 wrapper exposes FIPS-203 byte sizes" {
     try testing.expectEqual(@as(usize, 64), pqnoize.kem.seed_length);
     try testing.expectEqual(@as(usize, 32), pqnoize.kem.encaps_seed_length);
@@ -282,4 +279,46 @@ test "oracle: responder reads msg1 and produces clatter-identical msg2 + Split" 
     try testing.expectEqualSlices(u8, &oracle.handshake_hash, &hs.handshakeHash());
     try testing.expectEqualSlices(u8, &oracle.c1_key, &split.c1.k);
     try testing.expectEqualSlices(u8, &oracle.c2_key, &split.c2.k);
+}
+
+// ── NIST ACVP vectors for ML-KEM-768 (FIPS-203) ──────────────────────────
+//
+// Independent of clatter or any other PQNoise impl. These exercise the
+// underlying KEM primitive (Zig stdlib's ML-KEM-768) directly against
+// authoritative NIST test vectors. If stdlib regresses on FIPS-203
+// conformance — or if our KEM wrapper ever shifts byte interpretation —
+// these fire immediately. Vectors are downloaded and converted by
+// scripts/build-acvp.sh.
+
+const acvp = @import("acvp_ml_kem_vectors.zig");
+
+test "NIST ACVP ML-KEM-768 keyGen: generateDeterministic(d || z) matches" {
+    if (!acvp.generated) return error.SkipZigTest;
+    for (acvp.keygen) |tc| {
+        var seed: [pqnoize.kem.seed_length]u8 = undefined;
+        @memcpy(seed[0..32], &tc.d);
+        @memcpy(seed[32..64], &tc.z);
+        const kp = try pqnoize.kem.Kem.KeyPair.generateDeterministic(seed);
+        try testing.expectEqualSlices(u8, &tc.ek, &kp.public_key.toBytes());
+        try testing.expectEqualSlices(u8, &tc.dk, &kp.secret_key.toBytes());
+    }
+}
+
+test "NIST ACVP ML-KEM-768 encap: encapsDeterministic(ek, m) matches (ct, k)" {
+    if (!acvp.generated) return error.SkipZigTest;
+    for (acvp.encap) |tc| {
+        const pk = try pqnoize.kem.Kem.PublicKey.fromBytes(&tc.ek);
+        const enc = pk.encapsDeterministic(&tc.m);
+        try testing.expectEqualSlices(u8, &tc.ct, &enc.ciphertext);
+        try testing.expectEqualSlices(u8, &tc.k, &enc.shared_secret);
+    }
+}
+
+test "NIST ACVP ML-KEM-768 decap: decaps(dk, c) matches k incl. implicit rejection" {
+    if (!acvp.generated) return error.SkipZigTest;
+    for (acvp.decap) |tc| {
+        const sk = try pqnoize.kem.Kem.SecretKey.fromBytes(&tc.dk);
+        const k = try sk.decaps(&tc.c);
+        try testing.expectEqualSlices(u8, &tc.k, &k);
+    }
 }

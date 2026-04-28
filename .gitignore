@@ -3,3 +3,4 @@ zig-out/
 research/
 scripts/oracle/target/
 scripts/.toolchain/
+scripts/acvp/raw/
