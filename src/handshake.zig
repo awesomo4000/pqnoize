@@ -126,34 +126,45 @@ pub const HandshakeState = struct {
         };
     }
 
+    /// Walk the current message's tokens, summing the on-wire size each
+    /// token contributes and tracking whether the cipher will be armed
+    /// when the trailing payload is encrypted. `skem` adds a per-token
+    /// AEAD tag if the cipher is already armed when its turn comes.
     fn walkSizes(self: HandshakeState) Error!struct { tokens: usize, will_arm: bool } {
         const tokens = self.pat.messages[self.msg_index];
         var token_total: usize = 0;
-        var will_arm = self.sym.cipher != null;
-        for (tokens) |t| {
-            token_total += try tokenWireLen(t);
-            switch (t) {
-                .ekem, .skem, .psk => will_arm = true,
-                else => {},
-            }
-        }
-        return .{ .tokens = token_total, .will_arm = will_arm };
+        var armed = self.sym.cipher != null;
+        for (tokens) |t| switch (t) {
+            .e => token_total += kem.public_key_length,
+            .ekem => {
+                token_total += kem.ciphertext_length;
+                armed = true;
+            },
+            .skem => {
+                const tag: usize = if (armed) cipher_state.tag_length else 0;
+                token_total += kem.ciphertext_length + tag;
+                armed = true;
+            },
+            .psk => armed = true,
+            .s => return error.InvalidPatternToken,
+        };
+        return .{ .tokens = token_total, .will_arm = armed };
     }
 
     /// Total bytes `writeMessage` will emit for the given payload length.
     pub fn writeMessageLen(self: HandshakeState, payload_len: usize) Error!usize {
         if (self.isFinished()) return error.HandshakeAlreadyDone;
         const sizes = try self.walkSizes();
-        const tag: usize = if (sizes.will_arm) cipher_state.tag_length else 0;
-        return sizes.tokens + payload_len + tag;
+        const payload_tag: usize = if (sizes.will_arm) cipher_state.tag_length else 0;
+        return sizes.tokens + payload_len + payload_tag;
     }
 
     /// Payload-out length for a given received message.
     pub fn readPayloadLen(self: HandshakeState, msg_len: usize) Error!usize {
         if (self.isFinished()) return error.HandshakeAlreadyDone;
         const sizes = try self.walkSizes();
-        const tag: usize = if (sizes.will_arm) cipher_state.tag_length else 0;
-        const overhead = sizes.tokens + tag;
+        const payload_tag: usize = if (sizes.will_arm) cipher_state.tag_length else 0;
+        const overhead = sizes.tokens + payload_tag;
         if (msg_len < overhead) return error.InvalidMessageLength;
         return msg_len - overhead;
     }
@@ -196,12 +207,20 @@ pub const HandshakeState = struct {
                 pos += kem.ciphertext_length;
             },
             .skem => {
+                // skem differs from ekem in the canonical PQNoise wire shape:
+                // the KEM ciphertext is fed through `encryptAndHash` (so it
+                // gets AEAD-wrapped if the cipher is already armed), and the
+                // shared secret is mixed via `mixKeyAndHash` (HKDF-3, with
+                // an extra hash mixin). This matches the clatter reference
+                // implementation and is what other PQNoise implementations
+                // expect on the wire — a plain mix_key here causes silent
+                // interop failures that only show up at AEAD verification.
                 self.rng.bytes(rng_buf[0..kem.encaps_seed_length]);
                 const enc = self.rs.encapsDeterministic(rng_buf[0..kem.encaps_seed_length]);
-                @memcpy(out[pos..][0..kem.ciphertext_length], &enc.ciphertext);
-                self.sym.mixHash(&enc.ciphertext);
-                self.sym.mixKey(&enc.shared_secret);
-                pos += kem.ciphertext_length;
+                const skem_out_len = self.sym.ciphertextLen(kem.ciphertext_length);
+                _ = try self.sym.encryptAndHash(&enc.ciphertext, out[pos..][0..skem_out_len]);
+                self.sym.mixKeyAndHash(&enc.shared_secret);
+                pos += skem_out_len;
             },
             .s, .psk => return error.InvalidPatternToken,
         };
@@ -245,12 +264,19 @@ pub const HandshakeState = struct {
                 pos += kem.ciphertext_length;
             },
             .skem => {
-                const ct = msg[pos..][0..kem.ciphertext_length];
-                self.sym.mixHash(ct);
-                const ss = self.s.secret_key.decaps(ct) catch
+                // Mirror of writeMessage's skem: when cipher armed, the on-
+                // wire bytes are AEAD(skem_ct), so we decryptAndHash to
+                // recover the plaintext ct, decapsulate, then mixKeyAndHash
+                // on the shared secret.
+                const armed = self.sym.cipher != null;
+                const tag: usize = if (armed) cipher_state.tag_length else 0;
+                const wire_len = kem.ciphertext_length + tag;
+                var ct_buf: [kem.ciphertext_length]u8 = undefined;
+                _ = try self.sym.decryptAndHash(msg[pos..][0..wire_len], &ct_buf);
+                const ss = self.s.secret_key.decaps(&ct_buf) catch
                     return error.InvalidPublicKey;
-                self.sym.mixKey(&ss);
-                pos += kem.ciphertext_length;
+                self.sym.mixKeyAndHash(&ss);
+                pos += wire_len;
             },
             .s, .psk => return error.InvalidPatternToken,
         };
@@ -338,9 +364,9 @@ test "writeMessageLen / readPayloadLen are consistent across all pqKK messages" 
     _ = try resp.readMessage(m1_buf, &p1);
     try testing.expectEqualSlices(u8, "hello", &p1);
 
-    // msg 2: [ekem, skem] + payload + tag.
+    // msg 2: [ekem (raw 1088)] + [skem encrypted (1088 + 16 tag)] + [payload (7 + 16 tag)].
     try testing.expectEqual(
-        @as(usize, 2 * kem.ciphertext_length + 7 + cipher_state.tag_length),
+        @as(usize, 2 * kem.ciphertext_length + 2 * cipher_state.tag_length + 7),
         try resp.writeMessageLen(7),
     );
 }

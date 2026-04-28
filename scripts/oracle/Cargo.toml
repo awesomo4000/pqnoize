@@ -16,9 +16,12 @@ clatter = { version = "=2.2.0", default-features = false, features = [
 
 # We use these directly to drive pqKK manually (bypassing clatter's
 # RNG-driven `PqHandshake` so the vectors are byte-deterministic).
-ml-kem = { version = "=0.2.1", default-features = false, features = ["std", "deterministic"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 rand_core = "0.6"
+
+# Force a newer ml-kem than clatter's lockfile pin (0.2.1). 0.2.1 has a
+# broken transitive crypto-common version mix; 0.2.3 ships with that fixed.
+ml-kem = "=0.2.3"
 
 [profile.release]
 opt-level = 3

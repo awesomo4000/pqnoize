@@ -220,8 +220,9 @@ test "oracle: initiator produces clatter-identical msg1" {
         .secret_key = try pqnoize.kem.Kem.SecretKey.fromBytes(&oracle.alice_eph_sec),
     };
 
-    // Initiator side consumes 32 bytes for the skem in msg1.
-    var rng = pqnoize.testing.FixedBytesRng.init(&oracle.skem_msg1_seed);
+    // Initiator's full per-message rng stream (just the skem encaps m
+    // for pqKK msg1, since the ephemeral is pre-built).
+    var rng = pqnoize.testing.FixedBytesRng.init(&oracle.alice_rng);
     var hs = pqnoize.HandshakeState.init(.{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .initiator,
@@ -249,11 +250,9 @@ test "oracle: responder reads msg1 and produces clatter-identical msg2 + Split" 
     };
     const i_static_pub = try pqnoize.kem.Kem.PublicKey.fromBytes(&oracle.alice_static_pub);
 
-    // Responder consumes 64 bytes total in msg2: ekem (32) then skem (32).
-    var rng_buf: [64]u8 = undefined;
-    @memcpy(rng_buf[0..32], &oracle.ekem_msg2_seed);
-    @memcpy(rng_buf[32..64], &oracle.skem_msg2_seed);
-    var rng = pqnoize.testing.FixedBytesRng.init(&rng_buf);
+    // Responder's per-message rng stream: 32 B for ekem encaps + 32 B
+    // for skem encaps, in the same order our walker visits them.
+    var rng = pqnoize.testing.FixedBytesRng.init(&oracle.bob_rng);
 
     var hs = pqnoize.HandshakeState.init(.{
         .pattern = &pqnoize.pattern.pqKK,
