@@ -29,6 +29,12 @@ pub const framing = @import("framing.zig");
 pub const connection = @import("connection.zig");
 pub const Connection = connection.Connection;
 
+/// All errors any pqnoize call can produce. Equivalent to
+/// `connection.Error` since `Connection` sits at the top of the layer
+/// stack and unions every lower module's error set. Callers writing
+/// exhaustive handlers should switch on this.
+pub const Error = connection.Error;
+
 pub const testing = @import("testing/deterministic.zig");
 
 test {

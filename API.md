@@ -28,6 +28,9 @@ pub const framing         = @import("framing.zig");
 pub const connection      = @import("connection.zig");
 pub const Connection      = connection.Connection;
 
+/// All errors any pqnoize call can produce.
+pub const Error           = connection.Error;
+
 pub const testing         = @import("testing/deterministic.zig");
 ```
 
@@ -344,6 +347,7 @@ framing.Error         = { FrameTooLarge } || Allocator.Error
 connection.Error      = handshake.Error || framing.Error || {
                           NotEstablished, ConnectionClosed,
                         }
+pqnoize.Error         = connection.Error    // top-level alias
 ```
 
 `error.AuthenticationFailed` is the catch-all for "peer sent something
