@@ -90,6 +90,45 @@ Not yet implemented: graceful close handshake, rekeying, PSK patterns,
 ML-DSA peer-identity certificates. Real TCP usage will appear as a
 separate test client/server example program — never inside the library.
 
+## Entropy requirements
+
+Every handshake consumes randomness for ephemeral KEM keypair generation
+and KEM encapsulation seeds. The library never reaches for entropy
+itself — randomness flows through the `Rng` interface the caller
+provides.
+
+**The `Rng` MUST be cryptographically secure.** The production helper
+is `pqnoize.rng.fromIo(io)`, which routes through `std.Io.randomSecure`
+(syscall-backed, no fallback to weak sources, panics if entropy is
+unavailable rather than silently degrading). Anything else MUST be a
+real CSPRNG — never a seeded PRNG, never anything time-based.
+
+A predictable or low-entropy RNG breaks confidentiality and forward
+secrecy of every handshake the library produces. Static-key
+authentication still holds — a weak-RNG attacker can passively decrypt
+captured traffic but can't impersonate parties — but for any realistic
+deployment, "decrypts everything" is plenty bad. The canonical
+disaster is [CVE-2008-0166][cve-debian]: years of "random" Debian
+OpenSSL keys generated under a PRNG with effectively 15 bits of
+entropy, all guessable in minutes.
+
+**Boot-time concern.** On a freshly-booted system the kernel may not
+have accumulated initial entropy yet. On Linux ≥5.6 `getrandom(2)`
+blocks until first seeding — a handshake call simply waits rather than
+producing weak keys. On embedded systems with no hardware RNG, NTP
+down, and no persisted seed across reboots, this can take seconds to
+minutes. **Defer initiating handshakes** until the kernel reports
+sufficient entropy. Don't pin the system clock with a "good enough"
+fallback time and call it good — predictable seeds across a fleet are
+the exact failure shape.
+
+The deterministic helpers under `pqnoize.testing` (`SeedStream`,
+`FixedBytesRng`, `keypair`, `encaps`) are TEST-ONLY — they're built on
+SHAKE-256 expansion of a labeled seed for byte-for-byte handshake
+replay. Never wire them into a production code path.
+
+[cve-debian]: https://www.cve.org/CVERecord?id=CVE-2008-0166
+
 ## Threat model and scope
 
 - **Greenfield.** No interop with classical Noise, WireGuard, Signal, or

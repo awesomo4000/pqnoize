@@ -18,7 +18,8 @@ pub const pattern = @import("pattern.zig");
 pub const Pattern = pattern.Pattern;
 pub const Token = pattern.Token;
 
-pub const Rng = @import("rng.zig").Rng;
+pub const rng = @import("rng.zig");
+pub const Rng = rng.Rng;
 
 pub const handshake = @import("handshake.zig");
 pub const HandshakeState = handshake.HandshakeState;

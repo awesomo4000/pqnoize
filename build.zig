@@ -119,10 +119,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_fuzz_connection = b.addRunArtifact(fuzz_connection_tests);
-    const fuzz_connection_step = b.step("fuzz-connection", "Fuzz Connection.recv (add --fuzz for continuous mode)");
+    const fuzz_connection_step = b.step("fuzz-connection", "Fuzz Connection.recv with random bytes (add --fuzz for continuous mode)");
     fuzz_connection_step.dependOn(&run_fuzz_connection.step);
+
+    const fuzz_transport_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz_transport.zig"),
+            .target = target,
+            .optimize = fuzz_optimize,
+            .imports = &.{.{ .name = "pqnoize", .module = mod }},
+        }),
+    });
+    const run_fuzz_transport = b.addRunArtifact(fuzz_transport_tests);
+    const fuzz_transport_step = b.step("fuzz-transport", "Fuzz post-handshake transport with frame mutations (add --fuzz for continuous mode)");
+    fuzz_transport_step.dependOn(&run_fuzz_transport.step);
 
     const fuzz_step = b.step("fuzz", "Run all fuzz targets (add --fuzz for continuous mode)");
     fuzz_step.dependOn(&run_fuzz_framing.step);
     fuzz_step.dependOn(&run_fuzz_connection.step);
+    fuzz_step.dependOn(&run_fuzz_transport.step);
 }
