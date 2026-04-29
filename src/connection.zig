@@ -163,6 +163,17 @@ pub const Connection = struct {
     // ── Internal: handshake + transport drivers ───────────────────────
 
     fn processInbound(self: *Connection) Error!void {
+        // Per Noise rev 34 §11.2: "If decryption fails, the parties
+        // should abort the session." Any error in the transport- or
+        // handshake-decrypt path means the peer is hostile, the wire is
+        // corrupted, or our state machine is desynchronized — none of
+        // which is recoverable in-stream. Force the connection to
+        // `.closed` on any error so subsequent recv/send return
+        // ConnectionClosed rather than re-processing poisoned bytes
+        // (which the fuzzer caught: a tampered frame would stay in
+        // self.rx and fail every subsequent decrypt).
+        errdefer if (self.state != .closed) self.closeOnError();
+
         while (self.rx.peek()) |frame| {
             switch (self.state) {
                 .handshaking => |*hs| {
@@ -191,6 +202,22 @@ pub const Connection = struct {
                 .closed => return error.ConnectionClosed,
             }
         }
+    }
+
+    /// Wipe key material in-place and transition to `.closed`. Used on
+    /// any error path that means the session is dead but we're not
+    /// yet at the user's deinit call. ArrayLists stay live for the
+    /// caller's eventual `deinit` to clean up.
+    fn closeOnError(self: *Connection) void {
+        switch (self.state) {
+            .handshaking => |*hs| hs.secureZero(),
+            .established => |*est| {
+                est.rx.secureZero();
+                est.tx.secureZero();
+            },
+            .closed => return,
+        }
+        self.state = .closed;
     }
 
     /// While it's our turn, generate handshake message(s) into the tx

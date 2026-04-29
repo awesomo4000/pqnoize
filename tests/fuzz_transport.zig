@@ -159,6 +159,14 @@ fn fuzzTransport(setup: Setup, smith: *std.testing.Smith) !void {
                 defer receiver.freeMessage(got);
                 try std.testing.expectEqualSlices(u8, plaintext, got);
             },
+            // For all tamper variants: per Noise spec §11.2, the
+            // connection aborts on any decrypt failure. Our impl
+            // transitions to `.closed` accordingly. The harness drains
+            // anything that legitimately landed in the inbox before
+            // the abort (e.g. `extend` may parse a clean prefix
+            // successfully before AEAD-failing on the trailing junk),
+            // then ends this fuzz iteration. Smith starts the next
+            // iteration with fresh connection state.
             .flip_byte => {
                 if (frame.len > 0) {
                     const idx = smith.valueRangeAtMost(u32, 0, @intCast(frame.len - 1));
@@ -167,6 +175,7 @@ fn fuzzTransport(setup: Setup, smith: *std.testing.Smith) !void {
                 }
                 receiver.recv(frame) catch {};
                 while (receiver.nextMessage()) |msg| receiver.freeMessage(msg);
+                return;
             },
             .zero_payload => {
                 // Keep the 2-byte length prefix intact; zero out the
@@ -174,6 +183,7 @@ fn fuzzTransport(setup: Setup, smith: *std.testing.Smith) !void {
                 if (frame.len > 2) @memset(frame[2..], 0);
                 receiver.recv(frame) catch {};
                 while (receiver.nextMessage()) |msg| receiver.freeMessage(msg);
+                return;
             },
             .truncate => {
                 if (frame.len > 0) {
@@ -181,6 +191,7 @@ fn fuzzTransport(setup: Setup, smith: *std.testing.Smith) !void {
                     receiver.recv(frame[0..new_len]) catch {};
                     while (receiver.nextMessage()) |msg| receiver.freeMessage(msg);
                 }
+                return;
             },
             .extend => {
                 const extra = smith.valueRangeAtMost(u32, 1, 64);
@@ -188,12 +199,13 @@ fn fuzzTransport(setup: Setup, smith: *std.testing.Smith) !void {
                 defer gpa.free(ext);
                 @memcpy(ext[0..frame.len], frame);
                 smith.bytes(ext[frame.len..]);
-                // The recv may consume the original frame as a complete
-                // record then attempt to parse the trailing junk as a
-                // second record. Both behaviors are acceptable — what's
-                // not acceptable is a panic or a leak.
+                // The recv may parse the original frame cleanly and
+                // then AEAD-fail on the trailing junk, leaving the
+                // legit prefix in inbox. Drain whatever's there, then
+                // end the iteration.
                 receiver.recv(ext) catch {};
                 while (receiver.nextMessage()) |msg| receiver.freeMessage(msg);
+                return;
             },
         }
     }
