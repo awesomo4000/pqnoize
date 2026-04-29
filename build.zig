@@ -84,14 +84,25 @@ pub fn build(b: *std.Build) void {
     //   zig build fuzz-connection --fuzz  — same, for Connection.recv
     //   zig build fuzz --fuzz             — continuous, all targets
     //
-    // The `--fuzz` flag is consumed by `zig build` itself; the
-    // build runner reinstruments the test binary with coverage probes
-    // and drives it iteratively.
+    // The `--fuzz` flag is consumed by `zig build` itself; the build
+    // runner reinstruments the test binary with coverage probes and
+    // drives it iteratively.
+    //
+    // NOTE on optimize mode: 0.16.0's stdlib `test_runner.zig` has a
+    // type-mismatch bug in its Debug-mode error-printing path that
+    // prevents `--fuzz` from compiling under Debug. Pinning these test
+    // artifacts to `.ReleaseSafe` sidesteps the bug entirely while
+    // keeping safety checks (overflow, OOB) active — and Release-mode
+    // is what serious fuzz campaigns use anyway (more iters/sec).
+    // Tracked upstream: ziggit.dev/t/0-16-0-released/14930 (post #15).
+    // Revert to inheriting `optimize` once 0.16.1 ships the fix.
+    const fuzz_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+
     const fuzz_framing_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/fuzz_framing.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = fuzz_optimize,
             .imports = &.{.{ .name = "pqnoize", .module = mod }},
         }),
     });
@@ -103,7 +114,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/fuzz_connection.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = fuzz_optimize,
             .imports = &.{.{ .name = "pqnoize", .module = mod }},
         }),
     });
