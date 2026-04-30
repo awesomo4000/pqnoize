@@ -333,6 +333,120 @@ test "Connection: tampered transport ciphertext returns AuthenticationFailed" {
     try testing.expectError(error.AuthenticationFailed, responder.recv(buf));
 }
 
+test "Connection: many round-trip transport messages keep counters in sync" {
+    const gpa = testing.allocator;
+    var setup = pqnoize.testing.SeedStream.init("midstream-many-static");
+    const i_kp = try pqnoize.testing.keypair(&setup);
+    const r_kp = try pqnoize.testing.keypair(&setup);
+    var i_rng = pqnoize.testing.SeedStream.init("midstream-many-i");
+    var r_rng = pqnoize.testing.SeedStream.init("midstream-many-r");
+
+    var initiator = try pqnoize.Connection.initInitiator(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer initiator.deinit();
+    var responder = pqnoize.Connection.initResponder(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .responder,
+        .rng = rngFromSeedStream(&r_rng),
+        .s = r_kp,
+        .rs = i_kp.public_key,
+    });
+    defer responder.deinit();
+
+    try driveHandshake(&initiator, &responder);
+
+    // 32 round-trips alternating direction. Each direction's tx/rx
+    // counters increment independently, so this catches any
+    // off-by-one or wraparound-shape bug in the per-direction counter.
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const sender = if (i % 2 == 0) &initiator else &responder;
+        const receiver = if (i % 2 == 0) &responder else &initiator;
+        const tag: []const u8 = if (i % 2 == 0) "i->r" else "r->i";
+        const plaintext = try std.fmt.bufPrint(&buf, "{s} {d}", .{ tag, i });
+        try sender.send(plaintext);
+        _ = try shuttle(sender, receiver);
+        const got = receiver.nextMessage().?;
+        defer receiver.freeMessage(got);
+        try testing.expectEqualSlices(u8, plaintext, got);
+        try testing.expect(receiver.nextMessage() == null);
+    }
+}
+
+test "Connection: pipelined frames with mid-stream tamper preserves prefix and aborts" {
+    const gpa = testing.allocator;
+    var setup = pqnoize.testing.SeedStream.init("midstream-pipe-static");
+    const i_kp = try pqnoize.testing.keypair(&setup);
+    const r_kp = try pqnoize.testing.keypair(&setup);
+    var i_rng = pqnoize.testing.SeedStream.init("midstream-pipe-i");
+    var r_rng = pqnoize.testing.SeedStream.init("midstream-pipe-r");
+
+    var initiator = try pqnoize.Connection.initInitiator(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer initiator.deinit();
+    var responder = pqnoize.Connection.initResponder(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .responder,
+        .rng = rngFromSeedStream(&r_rng),
+        .s = r_kp,
+        .rs = i_kp.public_key,
+    });
+    defer responder.deinit();
+
+    try driveHandshake(&initiator, &responder);
+
+    // Three frames pipelined into one recv call. We tamper a byte
+    // inside the SECOND frame's ciphertext; the first frame is clean
+    // and must land in the responder's inbox before the AEAD failure
+    // on the second frame triggers session abort.
+    try initiator.send("frame_one");
+    try initiator.send("frame_two");
+    try initiator.send("frame_three");
+
+    const out = initiator.outgoing();
+    const buf = try gpa.alloc(u8, out.len);
+    defer gpa.free(buf);
+    @memcpy(buf, out);
+    initiator.consumeOutgoing(out.len);
+
+    // Locate the second frame using the u16-BE length prefix and
+    // flip a byte mid-ciphertext.
+    const f1_len = std.mem.readInt(u16, buf[0..2], .big);
+    const f2_start: usize = 2 + @as(usize, f1_len);
+    const f2_payload_len = std.mem.readInt(u16, buf[f2_start..][0..2], .big);
+    buf[f2_start + 2 + f2_payload_len / 2] ^= 1;
+
+    try testing.expectError(error.AuthenticationFailed, responder.recv(buf));
+
+    // Legitimate prefix preserved: frame_one's plaintext is in the inbox
+    // because it was processed cleanly before processInbound hit the
+    // tampered second frame and aborted.
+    const got = responder.nextMessage() orelse return error.MissingPrefix;
+    defer responder.freeMessage(got);
+    try testing.expectEqualSlices(u8, "frame_one", got);
+    // Nothing else made it through — frame_three's bytes are still in
+    // responder.rx but processInbound never reached them after the
+    // close-on-error transition.
+    try testing.expect(responder.nextMessage() == null);
+
+    // Session is closed. Further activity rejected with the same shape
+    // as the §11.2 abort test.
+    try testing.expect(!responder.isEstablished());
+    try testing.expectError(error.ConnectionClosed, responder.recv("more"));
+    try testing.expectError(error.ConnectionClosed, responder.send("nope"));
+}
+
 test "Connection: AEAD failure aborts the session per Noise §11.2" {
     const gpa = testing.allocator;
     var setup = pqnoize.testing.SeedStream.init("close-on-tamper-static");
