@@ -333,6 +333,55 @@ test "Connection: tampered transport ciphertext returns AuthenticationFailed" {
     try testing.expectError(error.AuthenticationFailed, responder.recv(buf));
 }
 
+test "Connection: AEAD failure aborts the session per Noise §11.2" {
+    const gpa = testing.allocator;
+    var setup = pqnoize.testing.SeedStream.init("close-on-tamper-static");
+    const i_kp = try pqnoize.testing.keypair(&setup);
+    const r_kp = try pqnoize.testing.keypair(&setup);
+    var i_rng = pqnoize.testing.SeedStream.init("close-on-tamper-i");
+    var r_rng = pqnoize.testing.SeedStream.init("close-on-tamper-r");
+
+    var initiator = try pqnoize.Connection.initInitiator(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .initiator,
+        .rng = rngFromSeedStream(&i_rng),
+        .s = i_kp,
+        .rs = r_kp.public_key,
+    });
+    defer initiator.deinit();
+    var responder = pqnoize.Connection.initResponder(gpa, .{
+        .pattern = &pqnoize.pattern.pqKK,
+        .role = .responder,
+        .rng = rngFromSeedStream(&r_rng),
+        .s = r_kp,
+        .rs = i_kp.public_key,
+    });
+    defer responder.deinit();
+
+    try driveHandshake(&initiator, &responder);
+    try testing.expect(initiator.isEstablished());
+    try testing.expect(responder.isEstablished());
+
+    // Initiator sends a real message. Tamper one byte mid-flight.
+    try initiator.send("payload");
+    const out = initiator.outgoing();
+    const tampered = try gpa.alloc(u8, out.len);
+    defer gpa.free(tampered);
+    @memcpy(tampered, out);
+    initiator.consumeOutgoing(out.len);
+    tampered[tampered.len - 1] ^= 1;
+
+    // First recv: AEAD verification fails as expected.
+    try testing.expectError(error.AuthenticationFailed, responder.recv(tampered));
+
+    // The fix from this audit: responder must now be closed, not stuck
+    // re-processing the bad frame from rx. Subsequent recv/send return
+    // ConnectionClosed, never AEAD failure on the same poisoned bytes.
+    try testing.expect(!responder.isEstablished());
+    try testing.expectError(error.ConnectionClosed, responder.recv("more bytes"));
+    try testing.expectError(error.ConnectionClosed, responder.send("nope"));
+}
+
 test "Connection: byte-at-a-time recv still drives the handshake to completion" {
     const gpa = testing.allocator;
     var setup = pqnoize.testing.SeedStream.init("conn-frag-static");

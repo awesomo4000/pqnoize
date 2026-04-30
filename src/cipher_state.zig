@@ -32,9 +32,11 @@ comptime {
     std.debug.assert(nonce_length == 12);
 }
 
-/// The Noise spec reserves nonce 2^64 - 1 (used by Rekey, when implemented),
-/// so a CipherState may use counter values 0 .. 2^64 - 2 inclusive. We fail
-/// closed before incrementing past that.
+/// The largest nonce a CipherState may use. The Noise spec reserves
+/// nonce 2^64 - 1 (for Rekey, when implemented), so usable values are
+/// `0 .. max_nonce` inclusive (i.e. 0 .. 2^64 - 2). After using
+/// `max_nonce`, the internal counter increments to 2^64 - 1 and the
+/// next call fails closed with `error.NonceExhausted`.
 pub const max_nonce: u64 = std.math.maxInt(u64) - 1;
 
 pub const Error = error{
@@ -78,7 +80,7 @@ pub const CipherState = struct {
         ciphertext_out: []u8,
     ) Error!void {
         std.debug.assert(ciphertext_out.len == ciphertextLen(plaintext.len));
-        if (self.n >= max_nonce) return error.NonceExhausted;
+        if (self.n > max_nonce) return error.NonceExhausted;
         const nonce = nonceBytes(self.n);
         const ct = ciphertext_out[0..plaintext.len];
         const tag: *[tag_length]u8 = ciphertext_out[plaintext.len..][0..tag_length];
@@ -98,7 +100,7 @@ pub const CipherState = struct {
     ) Error!void {
         std.debug.assert(ciphertext.len >= tag_length);
         std.debug.assert(plaintext_out.len == ciphertext.len - tag_length);
-        if (self.n >= max_nonce) return error.NonceExhausted;
+        if (self.n > max_nonce) return error.NonceExhausted;
         const nonce = nonceBytes(self.n);
         const ct = ciphertext[0..plaintext_out.len];
         const tag: [tag_length]u8 = ciphertext[plaintext_out.len..][0..tag_length].*;
@@ -210,16 +212,23 @@ test "tampered associated data returns AuthenticationFailed" {
     );
 }
 
-test "encryptWithAd rejects nonce exhaustion before producing output" {
+test "encryptWithAd rejects nonce exhaustion at the reserved value" {
     const key: [key_length]u8 = .{0x77} ** key_length;
     var enc = CipherState.init(key);
-    enc.n = max_nonce;
-
     var ct: [16 + tag_length]u8 = undefined;
+
+    // Last permitted nonce: max_nonce (= 2^64 - 2). Spec says 0..2^64-2
+    // are usable; 2^64 - 1 is reserved. Using max_nonce must succeed
+    // and advance the counter to the reserved value.
+    enc.n = max_nonce;
+    try enc.encryptWithAd("", "sixteen byte msg", &ct);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), enc.n);
+
+    // The next call hits the reserved value and must fail closed
+    // without advancing or producing output.
     try testing.expectError(
         error.NonceExhausted,
         enc.encryptWithAd("", "sixteen byte msg", &ct),
     );
-    // Counter must remain at the boundary; no partial advance.
-    try testing.expectEqual(max_nonce, enc.n);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), enc.n);
 }

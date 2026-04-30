@@ -72,6 +72,11 @@ pub const Connection = struct {
             .tx = .empty,
             .inbox = .empty,
         };
+        // If driveOutboundHandshake fails (OOM allocating the message
+        // buffer, OOM pushing to tx, etc.) the partially-built conn
+        // would otherwise leak its ArrayList allocations on the
+        // error-return path. Clean up explicitly.
+        errdefer conn.deinit();
         try conn.driveOutboundHandshake();
         return conn;
     }
@@ -117,6 +122,18 @@ pub const Connection = struct {
     }
 
     /// Encrypt `plaintext` and queue it as a transport frame.
+    ///
+    /// Errors thrown before any state mutation (`FrameTooLarge`,
+    /// `NotEstablished`, `ConnectionClosed`, OOM allocating the frame
+    /// buffer) leave the connection usable — the caller can adjust and
+    /// retry.
+    ///
+    /// Errors thrown after the AEAD counter has advanced
+    /// (`NonceExhausted` from `encryptWithAd` is checked pre-mutation
+    /// so it's safe; OOM on `tx.push` happens after counter advance —
+    /// peer is now ahead of us by one message-that-never-shipped) trigger
+    /// `closeOnError()`. The session is desynced and continuing to use
+    /// it would AEAD-fail on every subsequent decrypt at the peer.
     pub fn send(self: *Connection, plaintext: []const u8) Error!void {
         switch (self.state) {
             .established => |*est| {
@@ -124,8 +141,20 @@ pub const Connection = struct {
                     return error.FrameTooLarge;
                 const frame = try self.gpa.alloc(u8, plaintext.len + cipher_state.tag_length);
                 defer self.gpa.free(frame);
-                try est.tx.encryptWithAd(&.{}, plaintext, frame);
-                try self.tx.push(self.gpa, frame);
+                est.tx.encryptWithAd(&.{}, plaintext, frame) catch |err| {
+                    // Pre-mutation check (NonceExhausted) means counter
+                    // is unchanged, but the connection cannot make
+                    // forward progress regardless. Close.
+                    self.closeOnError();
+                    return err;
+                };
+                self.tx.push(self.gpa, frame) catch |err| {
+                    // Counter HAS advanced; we lost the encrypted
+                    // message. Peer's rx counter will reject everything
+                    // from here on. Close.
+                    self.closeOnError();
+                    return err;
+                };
             },
             .handshaking => return error.NotEstablished,
             .closed => return error.ConnectionClosed,
@@ -183,7 +212,7 @@ pub const Connection = struct {
                     const result = try hs.readMessage(frame, payload);
                     self.rx.pop();
                     if (result.split) |sp| {
-                        try self.transitionToEstablished(sp);
+                        self.transitionToEstablished(sp);
                         // Loop continues — any further frames are transport.
                     } else {
                         // It's now our turn (or peer's — drive will decide).
@@ -234,7 +263,7 @@ pub const Connection = struct {
                     const result = try hs.writeMessage("", buf);
                     try self.tx.push(self.gpa, buf);
                     if (result.split) |sp| {
-                        try self.transitionToEstablished(sp);
+                        self.transitionToEstablished(sp);
                         return;
                     }
                 },
@@ -243,7 +272,7 @@ pub const Connection = struct {
         }
     }
 
-    fn transitionToEstablished(self: *Connection, sp: symmetric_state.Split) !void {
+    fn transitionToEstablished(self: *Connection, sp: symmetric_state.Split) void {
         const role = switch (self.state) {
             .handshaking => |hs| hs.role,
             else => unreachable,
