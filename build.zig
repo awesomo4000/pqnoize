@@ -63,6 +63,18 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("test-e2e", "Run end-to-end handshake tests");
     e2e_step.dependOn(&run_e2e.step);
 
+    const oom_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/oom.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "pqnoize", .module = mod }},
+        }),
+    });
+    const run_oom = b.addRunArtifact(oom_tests);
+    const oom_step = b.step("test-oom", "Run OOM injection tests (exhaustive + random)");
+    oom_step.dependOn(&run_oom.step);
+
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
@@ -70,6 +82,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit.step);
     test_step.dependOn(&run_kats.step);
     test_step.dependOn(&run_e2e.step);
+    test_step.dependOn(&run_oom.step);
     test_step.dependOn(&run_exe_tests.step);
 
     // Fuzz steps — deliberately NOT wired into `zig build test`.
