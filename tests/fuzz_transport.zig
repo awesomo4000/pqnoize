@@ -100,7 +100,7 @@ fn fuzzTransport(setup: Setup, smith: *std.testing.Smith) !void {
     });
     defer initiator.deinit();
 
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),

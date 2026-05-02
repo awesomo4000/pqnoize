@@ -138,7 +138,12 @@ fn runSession(gpa: std.mem.Allocator, setup: Setup) !void {
         .rng = rngFromSeedStream(&r_rng),
         .s = setup.responder_static,
         .rs = setup.initiator_static.public_key,
-    });
+    }) catch |err| switch (err) {
+        // Same shape as initInitiator above — initResponder now allocates
+        // a HandshakeState, so OOM here is expected and clean.
+        error.OutOfMemory => return,
+        else => return err,
+    };
     defer responder.deinit();
 
     // Drive handshake. Any error here ends the session early.

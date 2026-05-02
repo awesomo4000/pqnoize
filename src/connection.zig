@@ -49,7 +49,15 @@ pub const Established = struct {
 };
 
 pub const State = union(enum) {
-    handshaking: HandshakeState,
+    /// Heap-allocated to keep the union — and therefore Connection —
+    /// small once we transition to `.established`. `HandshakeState` is
+    /// ~40 KB on x86_64 because ML-KEM-768 keypairs hold polynomials
+    /// in NTT form (much bigger than their encoded byte length).
+    /// Inlining that into the union would force every long-lived
+    /// post-handshake `Connection` to permanently retain those 40 KB
+    /// even though the ~80-byte `Established` is the only active
+    /// variant. Owner: the enclosing Connection's `gpa`.
+    handshaking: *HandshakeState,
     established: Established,
     closed: void,
 };
@@ -65,27 +73,31 @@ pub const Connection = struct {
 
     pub fn initInitiator(gpa: Allocator, opts: handshake.Init) Error!Connection {
         std.debug.assert(opts.role == .initiator);
+        const hs = try gpa.create(HandshakeState);
+        hs.* = HandshakeState.init(opts);
         var conn: Connection = .{
             .gpa = gpa,
-            .state = .{ .handshaking = HandshakeState.init(opts) },
+            .state = .{ .handshaking = hs },
             .rx = .empty,
             .tx = .empty,
             .inbox = .empty,
         };
         // If driveOutboundHandshake fails (OOM allocating the message
         // buffer, OOM pushing to tx, etc.) the partially-built conn
-        // would otherwise leak its ArrayList allocations on the
-        // error-return path. Clean up explicitly.
+        // would otherwise leak both ArrayList allocations and the
+        // heap-allocated HandshakeState. Clean up explicitly.
         errdefer conn.deinit();
         try conn.driveOutboundHandshake();
         return conn;
     }
 
-    pub fn initResponder(gpa: Allocator, opts: handshake.Init) Connection {
+    pub fn initResponder(gpa: Allocator, opts: handshake.Init) Error!Connection {
         std.debug.assert(opts.role == .responder);
+        const hs = try gpa.create(HandshakeState);
+        hs.* = HandshakeState.init(opts);
         return .{
             .gpa = gpa,
-            .state = .{ .handshaking = HandshakeState.init(opts) },
+            .state = .{ .handshaking = hs },
             .rx = .empty,
             .tx = .empty,
             .inbox = .empty,
@@ -98,7 +110,10 @@ pub const Connection = struct {
         for (self.inbox.items) |msg| self.gpa.free(msg);
         self.inbox.deinit(self.gpa);
         switch (self.state) {
-            .handshaking => |*hs| hs.secureZero(),
+            .handshaking => |hs| {
+                hs.secureZero();
+                self.gpa.destroy(hs);
+            },
             .established => |*est| {
                 est.rx.secureZero();
                 est.tx.secureZero();
@@ -205,7 +220,7 @@ pub const Connection = struct {
 
         while (self.rx.peek()) |frame| {
             switch (self.state) {
-                .handshaking => |*hs| {
+                .handshaking => |hs| {
                     const payload_len = try hs.readPayloadLen(frame.len);
                     const payload = try self.gpa.alloc(u8, payload_len);
                     defer self.gpa.free(payload);
@@ -239,7 +254,10 @@ pub const Connection = struct {
     /// caller's eventual `deinit` to clean up.
     fn closeOnError(self: *Connection) void {
         switch (self.state) {
-            .handshaking => |*hs| hs.secureZero(),
+            .handshaking => |hs| {
+                hs.secureZero();
+                self.gpa.destroy(hs);
+            },
             .established => |*est| {
                 est.rx.secureZero();
                 est.tx.secureZero();
@@ -255,7 +273,7 @@ pub const Connection = struct {
     fn driveOutboundHandshake(self: *Connection) Error!void {
         while (true) {
             switch (self.state) {
-                .handshaking => |*hs| {
+                .handshaking => |hs| {
                     if (!hs.isMyTurn()) return;
                     const msg_len = try hs.writeMessageLen(0);
                     const buf = try self.gpa.alloc(u8, msg_len);
@@ -283,7 +301,10 @@ pub const Connection = struct {
             .responder => .{ .tx = sp.c2, .rx = sp.c1 },
         };
         switch (self.state) {
-            .handshaking => |*hs| hs.secureZero(),
+            .handshaking => |hs| {
+                hs.secureZero();
+                self.gpa.destroy(hs);
+            },
             else => {},
         }
         self.state = .{ .established = established };

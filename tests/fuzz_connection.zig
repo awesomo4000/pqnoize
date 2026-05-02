@@ -55,7 +55,7 @@ fn fuzzRecvFromInit(setup: Setup, smith: *std.testing.Smith) !void {
     const gpa = std.testing.allocator;
 
     var rng_stream = pqnoize.testing.SeedStream.init("fuzz-conn-r-rng");
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&rng_stream),
@@ -104,7 +104,7 @@ fn fuzzRecvPostHandshake(setup: Setup, smith: *std.testing.Smith) !void {
     });
     defer initiator.deinit();
 
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),

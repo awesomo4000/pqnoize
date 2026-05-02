@@ -227,7 +227,7 @@ test "Connection: full handshake completes via byte shuttle" {
     });
     defer initiator.deinit();
 
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),
@@ -256,7 +256,7 @@ test "Connection: transport messages round-trip in both directions" {
     });
     defer initiator.deinit();
 
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),
@@ -310,7 +310,7 @@ test "Connection: tampered transport ciphertext returns AuthenticationFailed" {
     });
     defer initiator.deinit();
 
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),
@@ -333,6 +333,18 @@ test "Connection: tampered transport ciphertext returns AuthenticationFailed" {
     try testing.expectError(error.AuthenticationFailed, responder.recv(buf));
 }
 
+test "Connection: post-handshake size stays small (HandshakeState heap-allocated)" {
+    // Pins the size optimization. ML-KEM-768 keypairs in NTT form make
+    // an inline HandshakeState ~40 KB; we heap-allocate during the
+    // handshake and free at transitionToEstablished, so a long-lived
+    // .established Connection should be a few hundred bytes max.
+    // Threshold deliberately loose (256) — guards against a regression
+    // that re-inlines HandshakeState without sounding off on minor
+    // struct rearrangements.
+    try testing.expect(@sizeOf(pqnoize.Connection) <= 256);
+    try testing.expect(@sizeOf(pqnoize.connection.State) <= 128);
+}
+
 test "Connection: many round-trip transport messages keep counters in sync" {
     const gpa = testing.allocator;
     var setup = pqnoize.testing.SeedStream.init("midstream-many-static");
@@ -349,7 +361,7 @@ test "Connection: many round-trip transport messages keep counters in sync" {
         .rs = r_kp.public_key,
     });
     defer initiator.deinit();
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),
@@ -395,7 +407,7 @@ test "Connection: pipelined frames with mid-stream tamper preserves prefix and a
         .rs = r_kp.public_key,
     });
     defer initiator.deinit();
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),
@@ -463,7 +475,7 @@ test "Connection: AEAD failure aborts the session per Noise §11.2" {
         .rs = r_kp.public_key,
     });
     defer initiator.deinit();
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),
@@ -513,7 +525,7 @@ test "Connection: byte-at-a-time recv still drives the handshake to completion" 
     });
     defer initiator.deinit();
 
-    var responder = pqnoize.Connection.initResponder(gpa, .{
+    var responder = try pqnoize.Connection.initResponder(gpa, .{
         .pattern = &pqnoize.pattern.pqKK,
         .role = .responder,
         .rng = rngFromSeedStream(&r_rng),
