@@ -1,7 +1,7 @@
 # pqnoize API
 
-Reference for the public surface. All types live under the `pqnoize`
-module (re-exported from `src/root.zig`).
+Reference for the public surface. Types are re-exported from
+`src/root.zig`.
 
 ## Top-level re-exports
 
@@ -18,7 +18,8 @@ pub const pattern         = @import("pattern.zig");
 pub const Pattern         = pattern.Pattern;
 pub const Token           = pattern.Token;
 
-pub const Rng             = @import("rng.zig").Rng;
+pub const rng             = @import("rng.zig");
+pub const Rng             = rng.Rng;
 
 pub const handshake       = @import("handshake.zig");
 pub const HandshakeState  = handshake.HandshakeState;
@@ -28,7 +29,7 @@ pub const framing         = @import("framing.zig");
 pub const connection      = @import("connection.zig");
 pub const Connection      = connection.Connection;
 
-/// All errors any pqnoize call can produce.
+/// All errors any pqnoize call can produce. See "Errors" below.
 pub const Error           = connection.Error;
 
 pub const testing         = @import("testing/deterministic.zig");
@@ -44,79 +45,99 @@ encrypts/decrypts transport messages. Never touches a socket.
 ### Construction
 
 ```zig
-pub fn initInitiator(gpa: Allocator, opts: handshake.Init) !Connection;
-pub fn initResponder(gpa: Allocator, opts: handshake.Init) Connection;
+pub fn initInitiator(gpa: Allocator, opts: handshake.Init) Error!Connection;
+pub fn initResponder(gpa: Allocator, opts: handshake.Init) Error!Connection;
 pub fn deinit(self: *Connection) void;
 ```
 
-The initiator's first handshake message is queued at construction time.
-Both forms take ownership of the static keypair in `opts.s`.
+Both forms allocate a `*HandshakeState` on `gpa` (~40 KB; freed when
+the handshake completes at `Split`, or earlier on error/deinit). The
+initiator's first handshake message is queued into the outgoing
+buffer at construction time, ready for the caller's first
+`outgoing()` read. Both forms take ownership of the static keypair
+in `opts.s` (copied by value into the heap HandshakeState).
 
-### Driver loop API
+After `transitionToEstablished`, `@sizeOf(Connection)` is 176 bytes;
+the handshake's 40 KB is gone.
+
+### Driver-loop API
 
 ```zig
-pub fn recv(self: *Connection, bytes: []const u8) !void;
+pub fn recv(self: *Connection, bytes: []const u8) Error!void;
 pub fn outgoing(self: Connection) []const u8;
 pub fn consumeOutgoing(self: *Connection, n: usize) void;
 ```
 
-`recv` accepts whatever bytes the socket gave you (may straddle frame
-boundaries or be a single-byte fragment) and advances both the handshake
-and any post-Split transport processing. `outgoing` returns a borrowed
-slice of bytes the caller should write to the socket; `consumeOutgoing`
-acks how many bytes were actually written.
+`recv` accepts whatever bytes the socket gave you (may straddle
+frame boundaries or be a single-byte fragment); it advances both
+the handshake (until `.established`) and the transport
+(decrypting any fully-arrived frames into the inbox). `outgoing`
+returns a borrowed slice of bytes the caller should write to the
+socket; `consumeOutgoing` acks how many bytes were actually written.
+The slice from `outgoing` is invalidated by any other call.
 
 ### Application API
 
 ```zig
-pub fn send(self: *Connection, plaintext: []const u8) !void;
+pub fn send(self: *Connection, plaintext: []const u8) Error!void;
 pub fn nextMessage(self: *Connection) ?[]u8;
 pub fn freeMessage(self: *Connection, msg: []u8) void;
 pub fn isEstablished(self: Connection) bool;
+pub fn handshakeHash(self: Connection) ?[32]u8;
 ```
 
-`send` returns `error.NotEstablished` until the handshake has completed.
-`nextMessage` pops the oldest decrypted plaintext from the inbox; the
-caller takes ownership and releases via `freeMessage`.
+`send` returns `error.NotEstablished` until the handshake has
+completed. `nextMessage` pops the oldest decrypted plaintext from the
+inbox; the caller takes ownership and releases via `freeMessage`.
+`isEstablished` returns `false` after a successful close-on-error
+transition (e.g. AEAD verification failure).
 
-### `handshake.Init` options
+### `handshake.Init`
 
 ```zig
 pub const Init = struct {
     pattern:       *const pattern.Pattern,                  // &pqnoize.pattern.pqKK
     role:          Role,                                    // .initiator | .responder
-    rng:           Rng,                                     // see "Randomness" below
+    rng:           Rng,                                     // see Rng below
     s:             kem.Kem.KeyPair,                         // own static keypair
     rs:            kem.Kem.PublicKey,                       // peer static (pre-known)
     prologue:      []const u8 = &.{},
     protocol_name: []const u8 = pattern.pqKK_MLKEM768_protocol_name,
+    e:             ?kem.Kem.KeyPair = null,                 // TEST-ONLY: pre-built ephemeral
 };
 ```
 
+### Close-on-error semantics
+
+Per Noise §11.2, any decryption failure aborts the session. `recv`
+implements this: on AEAD verification failure (or any other error
+during inbound processing) the cipher states are wiped via
+`secureZero`, the heap HandshakeState is freed, and `state`
+transitions to `.closed`. Subsequent `recv` and `send` calls return
+`error.ConnectionClosed`.
+
+`send` follows the same rule for errors that leave state mid-mutated:
+a counter-exhausted `encryptWithAd` or an OOM in `tx.push` after the
+counter has advanced both close the connection. Errors that fire
+*before* state mutation (`FrameTooLarge`, `NotEstablished`, OOM
+allocating the frame buffer) do not — the caller can retry.
+
 ### Driver-loop sketch
 
-```zig
-fn run(stream: std.net.Stream, conn: *pqnoize.Connection) !void {
-    var read_buf: [4096]u8 = undefined;
-    while (true) {
-        const out = conn.outgoing();
-        if (out.len > 0) {
-            const n = try stream.write(out);
-            conn.consumeOutgoing(n);
-        }
-        const n = try stream.read(&read_buf);
-        if (n == 0) return;
-        try conn.recv(read_buf[0..n]);
-        while (conn.nextMessage()) |msg| {
-            defer conn.freeMessage(msg);
-            try app.handle(msg);
-        }
-    }
+```
+loop {
+    if conn.outgoing().len > 0:
+        write to socket; conn.consumeOutgoing(n_written)
+    if conn.isEstablished() and have_more_to_send:
+        conn.send(next_plaintext)
+    bytes = read from socket; if 0: break
+    conn.recv(bytes)
+    while msg = conn.nextMessage(): handle msg; conn.freeMessage(msg)
 }
 ```
 
-This sketch lives outside the library — `Connection` itself never imports
-`std.net`.
+Working code in `examples/client_server/` (real `std.Io.net` over
+TCP). The library itself never imports `std.net`.
 
 ---
 
@@ -146,10 +167,14 @@ pub fn handshakeHash(self: HandshakeState) [32]u8;
 pub fn secureZero(self: *HandshakeState) void;
 ```
 
-Each `writeMessage` / `readMessage` advances `msg_index`. The result
-struct carries an optional `Split` that is non-null only on the final
-message; from that point the handshake is finished and the caller should
-construct two `CipherState`s from the split for transport.
+`WriteResult` / `ReadResult` carry an optional `Split` that is
+non-null only on the final message. From that point the handshake
+is finished; the caller constructs two `CipherState`s from the
+split for transport. `Connection` does this internally.
+
+Direct callers must NOT reuse a `HandshakeState` after any of its
+methods returns an error — internal symmetric state may be partially
+mutated. (`Connection` insulates callers from this via close-on-error.)
 
 ---
 
@@ -177,8 +202,13 @@ pub const pqKK_MLKEM768_protocol_name: []const u8 =
     "Noise_pqKK_MLKEM768_ChaChaPoly_SHA256";
 ```
 
-Adding a new pattern (e.g. `pqIK`, `pqXX`) is a matter of describing its
-token sequence here; the `HandshakeState` interpreter does not change.
+Adding `pqIK`, `pqXX`, etc. is a matter of describing their token
+sequences here; the `HandshakeState` interpreter handles `e`, `ekem`,
+`skem`, and `psk` tokens uniformly. Note that `skem` differs from
+generic Noise treatment of `s`: it calls `encryptAndHash` on the
+KEM ciphertext (so the ct is AEAD-wrapped on the wire when the
+cipher is already armed) and `mixKeyAndHash` on the shared secret.
+This matches the clatter Rust reference.
 
 ---
 
@@ -204,11 +234,14 @@ pub fn decryptWithAd(
 pub fn nonceBytes(n: u64) [12]u8;   // [0,0,0,0] ++ LE(n) — Noise §12
 pub fn ciphertextLen(plaintext_len: usize) usize;
 pub fn secureZero(self: *CipherState) void;
+
+pub const max_nonce: u64 = std.math.maxInt(u64) - 1;  // 2^64 - 2 (last usable)
 ```
 
-Counter exhaustion (`n == 2^64 - 1`) returns `error.NonceExhausted`
-*before* producing output. AEAD tag failure leaves the counter
-unchanged.
+Counter exhaustion: after using nonce `max_nonce`, the internal
+counter advances to `2^64 - 1` (the spec-reserved value), and the
+next call returns `error.NonceExhausted` without producing output.
+AEAD tag failure leaves the counter unchanged (per Noise §5.1).
 
 ---
 
@@ -228,26 +261,31 @@ pub fn handshakeHash(self: SymmetricState) [32]u8;
 pub fn secureZero(self: *SymmetricState) void;
 ```
 
-Pre-MixKey, `encryptAndHash` is a memcpy + `mixHash`; post-MixKey it
-runs the inner CipherState with `ad = h`.
+Pre-MixKey, `encryptAndHash` is a memcpy + `mixHash` (the spec's
+"plaintext passthrough" mode); post-MixKey it runs the inner
+CipherState with `ad = h`. `decryptAndHash` mixes the *ciphertext*
+(input bytes) into `h`, not the plaintext, per spec.
 
 ---
 
 ## `kem` — ML-KEM-768 wrapper
 
 ```zig
-pub const Kem = std.crypto.kem.ml_kem.MLKem768;
+pub const Kem = std.crypto.kem.ml_kem.MLKem768;     // FIPS-203 nist namespace
 
 pub const seed_length:        usize = 64;
 pub const encaps_seed_length: usize = 32;
 pub const ciphertext_length:  usize = 1088;
 pub const shared_length:      usize = 32;
 pub const public_key_length:  usize = 1184;
-pub const secret_key_length:  usize = …;
+pub const secret_key_length:  usize = 2400;
 ```
 
-Use `Kem.KeyPair.generateDeterministic(seed)` for tests, `Kem.KeyPair.generate(io)`
-for production. Stick with the `nist` (FIPS-203) variant — never `kyber_d00`.
+These constants are checked at `comptime` against FIPS-203 — a
+stdlib rename or a 512/1024 mix-up fails the build. Use
+`Kem.KeyPair.generateDeterministic(seed)` for tests,
+`Kem.KeyPair.generate(io)` for production. Stick with the FIPS-203
+type — `kyber_d00` is the round-3 draft and is non-interoperable.
 
 ---
 
@@ -261,7 +299,7 @@ pub fn writeFrameHeader(out: *[2]u8, payload_len: usize) Error!void;
 pub fn readFrameHeader(bytes: *const [2]u8) usize;
 
 pub const FrameReader = struct {
-    pub const empty: FrameReader = …;
+    pub const empty: FrameReader = ...;
     pub fn deinit(self: *FrameReader, gpa: Allocator) void;
     pub fn push(self: *FrameReader, gpa: Allocator, bytes: []const u8) Error!void;
     pub fn peek(self: FrameReader) ?[]const u8;   // borrowed; invalidated by push/pop
@@ -269,7 +307,7 @@ pub const FrameReader = struct {
 };
 
 pub const FrameWriter = struct {
-    pub const empty: FrameWriter = …;
+    pub const empty: FrameWriter = ...;
     pub fn deinit(self: *FrameWriter, gpa: Allocator) void;
     pub fn push(self: *FrameWriter, gpa: Allocator, payload: []const u8) Error!void;
     pub fn outgoing(self: FrameWriter) []const u8;
@@ -277,12 +315,13 @@ pub const FrameWriter = struct {
 };
 ```
 
-Wire format: `[u16 big-endian length][payload]`. The same framing carries
-both handshake messages and post-Split transport ciphertexts.
+Wire format: `[u16 big-endian length][payload]`. The same framing
+carries both handshake messages and post-Split transport
+ciphertexts.
 
 ---
 
-## `Rng` — randomness injection
+## `rng` — randomness injection
 
 ```zig
 pub const Rng = struct {
@@ -290,15 +329,24 @@ pub const Rng = struct {
     fillFn: *const fn (ctx: *anyopaque, out: []u8) void,
     pub fn bytes(self: Rng, out: []u8) void;
 };
+
+/// Production helper: wraps std.Io.randomSecure (syscall-backed CSPRNG).
+/// Panics if the underlying Io reports EntropyUnavailable rather than
+/// silently using weak randomness. The caller's `io` must outlive the
+/// returned Rng.
+pub fn fromIo(io: *const std.Io) Rng;
 ```
 
-The library never reaches for `std.crypto.random` directly. Production
-callers wire `Rng` to `std.Io.random` (or another audited CSPRNG); tests
-wire it to a `SeedStream` for byte-for-byte handshake replay.
+The library never reaches for `std.crypto.random` directly. See the
+[Entropy requirements](README.md#entropy-requirements) section of
+the README for the threat model that motivates this design and the
+boot-time-entropy concern.
+
+For tests, see the `testing` namespace below.
 
 ---
 
-## `testing` — deterministic helpers
+## `testing` — deterministic helpers (TEST-ONLY)
 
 ```zig
 pub const SeedStream = struct {
@@ -307,11 +355,24 @@ pub const SeedStream = struct {
     pub fn next(self: *SeedStream) [32]u8;
 };
 
+pub const FixedBytesRng = struct {
+    pub fn init(bytes: []const u8) FixedBytesRng;
+    pub fn rng(self: *FixedBytesRng) Rng;
+};
+
 pub fn keypair(stream: *SeedStream) !kem.Kem.KeyPair;
 pub fn encaps(pk: kem.Kem.PublicKey, stream: *SeedStream) kem.Kem.EncapsulatedSecret;
 ```
 
-Bridge from a `SeedStream` to an `Rng`:
+`SeedStream` is SHAKE-256 expansion of a labeled root seed.
+Deterministic, byte-stream-style; useful for replayable handshakes.
+`FixedBytesRng` returns canned bytes from a slice — used by oracle
+tests where every byte of randomness is pinned.
+
+These helpers are TEST-ONLY. Wiring any of them into production
+breaks the security properties of the protocol.
+
+Bridging a `SeedStream` to an `Rng`:
 
 ```zig
 fn rngFromSeedStream(s: *pqnoize.testing.SeedStream) pqnoize.Rng {
@@ -350,7 +411,25 @@ connection.Error      = handshake.Error || framing.Error || {
 pqnoize.Error         = connection.Error    // top-level alias
 ```
 
-`error.AuthenticationFailed` is the catch-all for "peer sent something
-we can't trust" — it covers transport-message tampering, handshake
-ciphertext modification, and (indirectly) tampered KEM ciphertexts via
-ML-KEM's implicit-rejection behavior.
+What each means:
+
+| Error | Surface | Meaning |
+|---|---|---|
+| `NonceExhausted` | CipherState / Connection.send | Counter would equal `2^64 - 1` (reserved value). Connection auto-closes. |
+| `AuthenticationFailed` | CipherState / Connection.recv | AEAD tag invalid. Peer tampered, wire corrupt, or state desynced. Connection auto-closes. |
+| `InvalidLength` | SymmetricState | Caller passed an output buffer of the wrong size. |
+| `NotMyTurn` | HandshakeState | `writeMessage` called when it's the peer's turn (or vice versa). |
+| `HandshakeAlreadyDone` | HandshakeState | Method called after `Split` was emitted. |
+| `InvalidMessageLength` | HandshakeState | Frame doesn't match `writeMessageLen` / `readPayloadLen` for the current step. |
+| `InvalidPublicKey` | HandshakeState | Peer-supplied static or ephemeral pubkey didn't decode (NonCanonical). Connection auto-closes. |
+| `InvalidPatternToken` | HandshakeState | A token unsupported in `messages` (`s`, `psk`) appeared. Indicates a malformed Pattern. |
+| `FrameTooLarge` | framing / Connection.send | Caller asked us to frame a payload larger than 65535 bytes. |
+| `OutOfMemory` | framing / Allocator | Allocator returned OOM. May or may not auto-close depending on which alloc site (see Connection.send doc). |
+| `NotEstablished` | Connection.send | `send` called before handshake completed. |
+| `ConnectionClosed` | Connection.recv / Connection.send | Operation called on a connection in `.closed` state. |
+
+`error.AuthenticationFailed` is the catch-all for "peer sent
+something we can't trust" — covers transport-message tampering,
+handshake ciphertext modification, and (indirectly) tampered KEM
+ciphertexts via ML-KEM's implicit-rejection behavior (decap returns
+junk, AEAD then fails).

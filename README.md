@@ -1,30 +1,31 @@
 # pqnoize
 
-A minimal, opinionated, sans-IO post-quantum Noise protocol library in pure
-Zig. Single pattern (**pqKK**), single cipher suite (ML-KEM-768 +
-ChaCha20-Poly1305 + SHA-256), Zig stdlib only — no vendored dependencies.
+A sans-IO post-quantum Noise protocol library in pure Zig. Single
+pattern (**pqKK**), single cipher suite (ML-KEM-768 +
+ChaCha20-Poly1305 + SHA-256), Zig stdlib only — no vendored
+dependencies.
 
 ## What it is
 
-Greenfield, pure-PQ Noise. All Diffie-Hellman replaced by KEM operations
-per the [PQNoise paper][pqnoise] (Angel, Dowling, Hülsing, Schwabe, Weber,
-CCS 2022). Confidentiality, authentication, and forward secrecy all rely
-on ML-KEM-768 — no classical crypto fallback, no hybrid composition.
+Pure-PQ Noise per the [PQNoise paper][pqnoise] (Angel, Dowling,
+Hülsing, Schwabe, Weber, CCS 2022). All Diffie-Hellman replaced by
+KEM operations. Confidentiality, authentication, and forward secrecy
+all rely on ML-KEM-768.
 
-The library is sans-IO: it never imports `std.net`, never blocks, never
-picks an I/O strategy. The `Connection` state machine consumes byte
-slices and produces byte slices; the caller's driver loop handles the
-socket. Real TCP usage is intended to live in test client/server example
-programs once that work begins.
+The library is sans-IO: nothing under `src/` imports `std.net`,
+nothing blocks, nothing picks an I/O strategy. The `Connection`
+state machine consumes byte slices and produces byte slices; the
+caller's driver loop owns the socket. A working TCP demo lives under
+`examples/client_server/`.
 
 ## Cipher suite
 
-| Role | Choice              | Pinned size                  |
-| ---- | ------------------- | ---------------------------- |
-| KEM  | ML-KEM-768 (FIPS 203) | pubkey 1184, ct 1088, ss 32 |
-| AEAD | ChaCha20-Poly1305   | key 32, nonce 12, tag 16     |
-| Hash | SHA-256             | digest 32                    |
-| KDF  | HKDF-SHA256         | (Noise §4.3 recursive HMAC)  |
+| Role | Choice                | Pinned size                        |
+| ---- | --------------------- | ---------------------------------- |
+| KEM  | ML-KEM-768 (FIPS 203) | pubkey 1184, secretkey 2400, ct 1088, ss 32 |
+| AEAD | ChaCha20-Poly1305     | key 32, nonce 12, tag 16           |
+| Hash | SHA-256               | digest 32                          |
+| KDF  | HKDF-SHA256           | (Noise §4.3 recursive HMAC)        |
 
 Protocol name (fed to `SymmetricState.init`):
 `Noise_pqKK_MLKEM768_ChaChaPoly_SHA256`.
@@ -43,101 +44,164 @@ messages:
   <- [ekem, skem]
 ```
 
-Two messages, mutual KEM authentication via `skem`, no DH anywhere.
-Mirrors classical Noise KK (also two messages) — because both sides
-already know each other's static, the initiator can encapsulate to the
-responder's static in its very first message.
-See [API.md](API.md) for the full call surface.
+Two messages, mutual KEM authentication via `skem`, no DH. Mirrors
+classical Noise KK — because both sides already know each other's
+static, the initiator can encapsulate to the responder's static in
+its very first message.
+
+A non-obvious detail compared to generic Noise: the `skem` token
+calls `encryptAndHash` on the KEM ciphertext (so when the cipher is
+already armed, the skem ct is AEAD-wrapped on the wire) and
+`mixKeyAndHash` on the shared secret (HKDF-3 with an extra hash
+mixin). This matches the `clatter` reference implementation. See
+[API.md](API.md) for the full call surface.
 
 ## Build & test
 
 Requires Zig 0.16.
 
-```bash
-zig build test           # run all tests (unit + KATs + e2e)
-zig build test-unit      # inline tests under src/
-zig build test-kats      # known-answer vectors
-zig build test-e2e       # initiator <-> responder integration
 ```
+zig build test                  # all default tests (unit + KATs + e2e + OOM)
+zig build test-unit             # inline tests under src/
+zig build test-kats             # known-answer vectors
+zig build test-e2e              # initiator <-> responder integration
+zig build test-oom              # OOM injection (exhaustive + random)
+
+zig build fuzz                  # smoke pass through every fuzz target
+zig build fuzz-framing          # fuzz the framing parser
+zig build fuzz-connection       # fuzz Connection.recv with adversarial bytes
+zig build fuzz-transport        # fuzz post-handshake transport with mutations
+# Append --fuzz to enter continuous coverage-guided mode (Ctrl-C to stop).
+
+zig build run-example-server    # start the demo server (terminal A)
+zig build run-example-client    # run the demo client  (terminal B)
+```
+
+Two regenerable artifacts have their own scripts:
+
+```
+scripts/build-oracle.sh         # rebuilds tests/oracle_vectors.zig from
+                                # the clatter Rust reference impl
+scripts/build-acvp.sh           # rebuilds tests/acvp_ml_kem_vectors.zig
+                                # from NIST ACVP-Server test files
+```
+
+Both write Zig source files that are checked in; CI doesn't need a
+Rust toolchain or a network connection. Re-run only when bumping the
+underlying source.
 
 ## Layout
 
 ```
 src/
-  cipher_state.zig       AEAD + Noise nonce
-  symmetric_state.zig    ck/h, HKDF chain, encrypt/decrypt-and-hash, split
-  kem.zig                ML-KEM-768 wrapper
-  pattern.zig            tokens, Pattern, pqKK constant
-  rng.zig                type-erased randomness injection
-  handshake.zig          token-walking pqKK interpreter
-  framing.zig            u16-BE length-prefixed records
-  connection.zig         Connection (sans-IO surface)
+  cipher_state.zig            AEAD + Noise nonce
+  symmetric_state.zig         ck/h, HKDF chain, encrypt/decrypt-and-hash, split
+  kem.zig                     ML-KEM-768 wrapper
+  pattern.zig                 tokens, Pattern, pqKK constant
+  rng.zig                     type-erased randomness; production fromIo helper
+  handshake.zig               token-walking pqKK interpreter
+  framing.zig                 u16-BE length-prefixed records
+  connection.zig              Connection (sans-IO surface)
   testing/
-    deterministic.zig    SeedStream + ML-KEM helpers for replay tests
+    deterministic.zig         SeedStream + ML-KEM helpers (TEST-ONLY)
 tests/
-  kats.zig               RFC 8439 + Noise nonce + HKDF chain + KEM sizes
-  e2e.zig                full handshake, transport, fragmentation, tamper
+  kats.zig                    RFC 8439 + Noise nonce + HKDF chain + KEM sizes
+                              + clatter oracle + NIST ACVP vectors
+  e2e.zig                     handshake, transport, fragmentation, tamper,
+                              close-on-AEAD-failure, pipelined frames
+  oom.zig                     exhaustive + random OOM injection
+  fuzz_framing.zig            framing parser fuzz target
+  fuzz_connection.zig         Connection.recv fuzz target (random bytes)
+  fuzz_transport.zig          post-handshake transport fuzz with mutations
+  oracle_vectors.zig          GENERATED by scripts/build-oracle.sh
+  acvp_ml_kem_vectors.zig     GENERATED by scripts/build-acvp.sh
+examples/
+  client_server/
+    server.zig                TCP demo server (listens, accepts one client)
+    client.zig                TCP demo client (HI / STATUS / BYE)
+scripts/
+  build-oracle.sh             clatter Rust oracle bootstrap + harness
+  build-acvp.sh               NIST ACVP downloader + JSON→Zig converter
+  oracle/                     Rust harness sources
+  acvp/                       Python converter
 ```
 
 ## Status
 
-Sans-IO core is complete: full pqKK handshake reaches `Established`,
-transport messages encrypt/decrypt in both directions, AEAD failures
-surface as `error.AuthenticationFailed`, and every byte produced is
-deterministic under a seeded RNG.
+Implemented:
 
-Not yet implemented: graceful close handshake, rekeying, PSK patterns,
-ML-DSA peer-identity certificates. Real TCP usage will appear as a
-separate test client/server example program — never inside the library.
+- pqKK handshake (2-message, byte-for-byte equivalent to clatter).
+- Transport: encrypt/decrypt round-trip, frame-level pipelining, AEAD
+  failure aborts the session per Noise §11.2 (close-on-error).
+- Sans-IO `Connection` (~176 bytes after handshake; handshake state is
+  heap-allocated and freed at Split).
+- Production randomness via `pqnoize.rng.fromIo(io)` (routes through
+  `std.Io.randomSecure`, panics if entropy is unavailable).
+- TCP example client/server under `examples/`.
+- Two cross-implementation oracles: clatter (full pqKK transcript) and
+  NIST ACVP (ML-KEM-768 primitive conformance).
+- Fuzz harnesses: framing parser, Connection.recv random-bytes,
+  Connection.recv post-handshake with mutation.
+- OOM injection coverage (every alloc site, exhaustive + random).
+
+Not implemented:
+
+- Graceful close handshake (peer-side connection just sees socket close).
+- Rekeying mid-session.
+- PSK patterns (`pqKKpsk0` etc.).
+- Other pqXX/pqIK patterns (the walker handles them; the constants
+  aren't defined).
+- ML-DSA peer-identity certificates (out-of-scope; transport-only lib).
 
 ## Entropy requirements
 
-Every handshake consumes randomness for ephemeral KEM keypair generation
-and KEM encapsulation seeds. The library never reaches for entropy
-itself — randomness flows through the `Rng` interface the caller
-provides.
+Every handshake consumes randomness for ephemeral KEM keypair
+generation and KEM encapsulation seeds. The library never reaches
+for entropy itself — randomness flows through the `Rng` interface
+the caller provides.
 
-**The `Rng` MUST be cryptographically secure.** The production helper
-is `pqnoize.rng.fromIo(io)`, which routes through `std.Io.randomSecure`
+**The `Rng` MUST be cryptographically secure.** Production helper:
+`pqnoize.rng.fromIo(io)`, which routes through `std.Io.randomSecure`
 (syscall-backed, no fallback to weak sources, panics if entropy is
 unavailable rather than silently degrading). Anything else MUST be a
 real CSPRNG — never a seeded PRNG, never anything time-based.
 
 A predictable or low-entropy RNG breaks confidentiality and forward
 secrecy of every handshake the library produces. Static-key
-authentication still holds — a weak-RNG attacker can passively decrypt
-captured traffic but can't impersonate parties — but for any realistic
-deployment, "decrypts everything" is plenty bad. The canonical
-disaster is [CVE-2008-0166][cve-debian]: years of "random" Debian
-OpenSSL keys generated under a PRNG with effectively 15 bits of
-entropy, all guessable in minutes.
+authentication still holds — a weak-RNG attacker can passively
+decrypt captured traffic but can't impersonate parties — but for any
+realistic deployment, "decrypts everything" is the bar to meet.
+Canonical disaster: [CVE-2008-0166][cve-debian].
 
 **Boot-time concern.** On a freshly-booted system the kernel may not
 have accumulated initial entropy yet. On Linux ≥5.6 `getrandom(2)`
-blocks until first seeding — a handshake call simply waits rather than
-producing weak keys. On embedded systems with no hardware RNG, NTP
-down, and no persisted seed across reboots, this can take seconds to
-minutes. **Defer initiating handshakes** until the kernel reports
-sufficient entropy. Don't pin the system clock with a "good enough"
-fallback time and call it good — predictable seeds across a fleet are
-the exact failure shape.
+blocks until first seeding — a handshake call simply waits rather
+than producing weak keys. On embedded systems with no hardware RNG,
+NTP down, and no persisted seed across reboots, the wait can be
+seconds to minutes after first boot. Defer initiating handshakes
+until the kernel reports sufficient entropy. Don't pin the system
+clock with a "good enough" fallback time — predictable seeds across
+a fleet are the exact failure shape.
 
 The deterministic helpers under `pqnoize.testing` (`SeedStream`,
-`FixedBytesRng`, `keypair`, `encaps`) are TEST-ONLY — they're built on
-SHAKE-256 expansion of a labeled seed for byte-for-byte handshake
-replay. Never wire them into a production code path.
+`FixedBytesRng`, `keypair`, `encaps`) are TEST-ONLY. SHAKE-256
+expansion of a labeled seed for byte-for-byte handshake replay.
+Never wire them into a production code path.
 
 [cve-debian]: https://www.cve.org/CVERecord?id=CVE-2008-0166
 
 ## Threat model and scope
 
-- **Greenfield.** No interop with classical Noise, WireGuard, Signal, or
-  any deployed PQ system.
-- **Single pattern, single cipher suite, single transport mode.** Not a
-  general-purpose crypto library.
+- **Greenfield.** No interop with classical Noise, WireGuard, Signal,
+  or any deployed PQ system.
+- **Single pattern, single cipher suite, single transport mode.** Not
+  a general-purpose crypto library.
 - **No traffic-analysis resistance.** Standard Noise leaks message
   lengths and timing; pad-and-jitter is out of scope.
-- **Harvest-now-decrypt-later** is the motivating threat. Pure-PQ rather
-  than hybrid is a deliberate choice for greenfield deployment.
+- **Harvest-now-decrypt-later** is the motivating threat. Pure-PQ
+  rather than hybrid is a deliberate choice for greenfield deployment;
+  callers who need interop with the wider world should look at
+  hybrid Noise variants (e.g. OpenSSH 9.9's `mlkem768x25519-sha256`)
+  instead.
 
 [pqnoise]: https://eprint.iacr.org/2022/539
