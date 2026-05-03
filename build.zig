@@ -29,6 +29,40 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
+    // Example client/server programs (real TCP). These live OUTSIDE
+    // the library — `src/` itself never imports `std.net`. The
+    // examples demonstrate how a caller wires a sans-IO `Connection`
+    // into a real socket loop.
+    const example_server = b.addExecutable(.{
+        .name = "example-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/client_server/server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "pqnoize", .module = mod }},
+        }),
+    });
+    b.installArtifact(example_server);
+    const run_server_step = b.step("run-example-server", "Run the demo server");
+    const run_server_cmd = b.addRunArtifact(example_server);
+    run_server_step.dependOn(&run_server_cmd.step);
+    if (b.args) |args| run_server_cmd.addArgs(args);
+
+    const example_client = b.addExecutable(.{
+        .name = "example-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/client_server/client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "pqnoize", .module = mod }},
+        }),
+    });
+    b.installArtifact(example_client);
+    const run_client_step = b.step("run-example-client", "Run the demo client");
+    const run_client_cmd = b.addRunArtifact(example_client);
+    run_client_step.dependOn(&run_client_cmd.step);
+    if (b.args) |args| run_client_cmd.addArgs(args);
+
     // Test steps:
     //   zig build test         — run everything
     //   zig build test-unit    — inline tests under src/
